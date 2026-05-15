@@ -140,6 +140,15 @@ pub use self::error::*;
 pub use self::icon::{BadIcon, Icon};
 pub use self::tray_icon_id::TrayIconId;
 
+/// Set the OHOS app context for tray icon initialization.
+///
+/// This must be called before creating any tray icons on OpenHarmony.
+/// Tauri calls this automatically during app initialization.
+#[cfg(target_env = "ohos")]
+pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
+    platform_impl::set_ohos_app(app);
+}
+
 /// Re-export of [muda](::muda) crate and used for tray context menu.
 pub mod menu {
     pub use muda::*;
@@ -537,7 +546,7 @@ impl TrayIcon {
     /// # Safety
     ///
     /// The returned pointer is valid as long as the `TrayIcon` is.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(target_os = "macos"), not(target_env = "ohos")))]
     pub unsafe fn app_indicator(&self) -> *const libappindicator::AppIndicator {
         self.tray.borrow().app_indicator() as *const _
     }

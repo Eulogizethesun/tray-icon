@@ -10,7 +10,7 @@ use thiserror::Error;
 pub enum Error {
     #[error(transparent)]
     OsError(#[from] std::io::Error),
-    #[cfg(any(
+    #[cfg(all(
         any(
             target_os = "linux",
             target_os = "dragonfly",
@@ -18,12 +18,21 @@ pub enum Error {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
-        target_os = "macos"
+        not(target_env = "ohos")
     ))]
+    #[error(transparent)]
+    PngEncodingError(#[from] png::EncodingError),
+    #[cfg(target_os = "macos")]
     #[error(transparent)]
     PngEncodingError(#[from] png::EncodingError),
     #[error("not on the main thread")]
     NotMainThread,
+    #[cfg(target_env = "ohos")]
+    #[error("OpenHarmony error: {0}")]
+    OhosError(String),
+    #[cfg(target_env = "ohos")]
+    #[error("Operation not supported on OpenHarmony")]
+    Unsupported,
 }
 
 /// Convenient type alias of Result type for tray-icon.

@@ -41,11 +41,11 @@ features = [
   "Win32_UI_Shell",
 ]
 
-[target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"netbsd\", target_os = \"openbsd\"))".dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"), not(target_env = "ohos")))'.dependencies]
 libappindicator = { version = "0.9", optional = true }
 dirs = "6"
 
-[target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"netbsd\", target_os = \"openbsd\"))".dev-dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"), not(target_env = "ohos")))'.dev-dependencies]
 gtk = "0.18"
 
 [target."cfg(target_os = \"macos\")".dependencies]
@@ -88,12 +88,26 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSWindow",
 ] }
 
-[target."cfg(any(target_os = \"linux\", target_os = \"macos\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"netbsd\", target_os = \"openbsd\"))".dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"), not(target_env = "ohos")))'.dependencies]
 png = "0.18"
 
-[dev-dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"), not(target_env = "ohos")))'.dev-dependencies]
 winit = "0.30"
 tao = "0.34"
 eframe = "0.31"
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json = "1"
+
+[target.'cfg(target_env = "ohos")'.dev-dependencies]
+serde_json = "1"
+
+[patch.crates-io]
+muda = { path = "../muda" }
+
+[target."cfg(target_env = \"ohos\")".dependencies]
+openharmony-ability = { path = "../openharmony-ability/crates/ability", features = ["menu"] }
+png = "0.18"
+base64 = "0.22"
+log = "0.4"
+serde = "1"
 serde_json = "1"
