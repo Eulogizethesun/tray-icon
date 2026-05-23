@@ -1,3 +1,13 @@
+// OHOS StatusBar API limitations (cannot be fixed at application level):
+// - No double-click detection (StatusBar callback has no "doubleClick" type)
+// - No hover/enter/leave tracking (only "leftClick"/"rightClick" click_type)
+// - No click position coordinates (callback provides only click_type + menuCode)
+// - No middle button support (StatusBar has no "middleClick" type)
+// - No button press state (callback fires on completed click only)
+// Application-internal components have full OHOS gesture/mouse API support,
+// but StatusBar tray icon operates through a system-level extension with
+// limited callback data.
+
 use crate::{
     dpi::PhysicalPosition, MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId,
 };
@@ -94,7 +104,7 @@ fn execute_predefined_action(predefined_type: &str) {
             let app = super::get_ohos_app();
             app.exit(0);
         }
-        "minimize" | "hide" | "maximize" | "close" | "fullscreen" => {
+        "minimize" | "hide" | "maximize" | "close" | "fullscreen" | "about" => {
             openharmony_ability::statusbar::execute_predefined_action(predefined_type).ok();
         }
         _ => {
@@ -215,12 +225,19 @@ mod tests {
 
         match tray_event {
             TrayIconEvent::Click {
+                id,
                 button,
                 button_state,
-                ..
+                position,
+                rect,
             } => {
+                assert_eq!(id.0, get_current_tray_id().0);
                 assert_eq!(button, MouseButton::Left);
                 assert_eq!(button_state, MouseButtonState::Up);
+                assert_eq!(position.x, 0.0);
+                assert_eq!(position.y, 0.0);
+                assert_eq!(rect.position.x, 0.0);
+                assert_eq!(rect.size.width, 0);
             }
             _ => panic!("unexpected event type"),
         }
@@ -235,12 +252,19 @@ mod tests {
 
         match tray_event {
             TrayIconEvent::Click {
+                id,
                 button,
                 button_state,
-                ..
+                position,
+                rect,
             } => {
+                assert!(id.0.contains("item_0"));
                 assert_eq!(button, MouseButton::Right);
                 assert_eq!(button_state, MouseButtonState::Up);
+                assert_eq!(position.x, 0.0);
+                assert_eq!(position.y, 0.0);
+                assert_eq!(rect.position.x, 0.0);
+                assert_eq!(rect.size.width, 0);
             }
             _ => panic!("unexpected event type"),
         }
