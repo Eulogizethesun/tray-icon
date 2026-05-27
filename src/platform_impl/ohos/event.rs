@@ -104,7 +104,9 @@ fn execute_predefined_action(predefined_type: &str) {
             let app = super::get_ohos_app();
             app.exit(0);
         }
-        "minimize" | "hide" | "maximize" | "close" | "fullscreen" | "about" => {
+        "minimize" | "hide" | "maximize" | "close" | "fullscreen" | "about"
+        | "copy" | "cut" | "paste" | "selectAll" | "undo" | "redo"
+        | "recover" => {
             openharmony_ability::statusbar::execute_predefined_action(predefined_type).ok();
         }
         _ => {
