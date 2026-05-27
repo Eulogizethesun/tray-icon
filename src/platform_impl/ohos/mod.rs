@@ -183,6 +183,12 @@ impl TrayIcon {
 
     pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {}
 
+    // OHOS: rect() always returns None.
+    // StatusBar API does not provide tray icon position or dimensions.
+    // AvoidArea.topRect returns the entire status bar area (e.g. {0,0,1440,48}),
+    // not the tray icon itself — using it as an approximation would mislead callers
+    // who rely on rect for popup positioning or size calculations.
+    // This is consistent with Linux, which also returns None.
     pub fn rect(&self) -> Option<crate::Rect> {
         None
     }
@@ -342,6 +348,10 @@ pub(crate) struct MenuJsonItem {
     text: Option<String>,
     #[serde(rename = "type", default)]
     item_type: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    accelerator: Option<String>,
     #[serde(rename = "predefinedType")]
     predefined_type: Option<String>,
     #[serde(rename = "submenuItems")]
@@ -350,6 +360,28 @@ pub(crate) struct MenuJsonItem {
     checked: Option<bool>,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(rename = "aboutMetadata", default)]
+    about_metadata: Option<AboutMetadataJson>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct AboutMetadataJson {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(rename = "shortVersion", default)]
+    short_version: Option<String>,
+    #[serde(default)]
+    authors: Option<Vec<String>>,
+    #[serde(default)]
+    comments: Option<String>,
+    #[serde(default)]
+    copyright: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    website: Option<String>,
 }
 
 pub(crate) fn is_separator(item: &MenuJsonItem) -> bool {
@@ -497,18 +529,54 @@ fn build_item_from_attrs(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_regular_item_becomes_top_level_menu_item() {
-        let item = MenuJsonItem {
-            id: "item_1".to_string(),
-            text: Some("Open".to_string()),
-            enabled: true,
+    fn make_item(id: &str, text: &str) -> MenuJsonItem {
+        MenuJsonItem {
+            id: id.to_string(),
+            text: Some(text.to_string()),
+            enabled: Some(true),
+            accelerator: None,
             item_type: "item".to_string(),
             predefined_type: None,
             submenu_items: None,
             checked: None,
             icon: None,
-        };
+            about_metadata: None,
+        }
+    }
+
+    fn make_separator(id: &str) -> MenuJsonItem {
+        MenuJsonItem {
+            id: id.to_string(),
+            text: None,
+            enabled: Some(false),
+            accelerator: None,
+            item_type: "predefined".to_string(),
+            predefined_type: Some("separator".to_string()),
+            submenu_items: None,
+            checked: None,
+            icon: None,
+            about_metadata: None,
+        }
+    }
+
+    fn make_submenu(id: &str, text: &str, children: Vec<MenuJsonItem>) -> MenuJsonItem {
+        MenuJsonItem {
+            id: id.to_string(),
+            text: Some(text.to_string()),
+            enabled: Some(true),
+            accelerator: None,
+            item_type: "submenu".to_string(),
+            predefined_type: None,
+            submenu_items: Some(children),
+            checked: None,
+            icon: None,
+            about_metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_regular_item_becomes_top_level_menu_item() {
+        let item = make_item("item_1", "Open");
         let result = menu_json_item_to_status_bar_item(item);
 
         assert_eq!(result.title, "Open");
@@ -521,37 +589,10 @@ mod tests {
 
     #[test]
     fn test_submenu_becomes_item_with_sub_menu() {
-        let item = MenuJsonItem {
-            id: "submenu_1".to_string(),
-            text: Some("File".to_string()),
-            enabled: true,
-            item_type: "submenu".to_string(),
-            predefined_type: None,
-            submenu_items: Some(vec![
-                MenuJsonItem {
-                    id: "item_new".to_string(),
-                    text: Some("New".to_string()),
-                    enabled: true,
-                    item_type: "item".to_string(),
-                    predefined_type: None,
-                    submenu_items: None,
-                    checked: None,
-                    icon: None,
-                },
-                MenuJsonItem {
-                    id: "item_open".to_string(),
-                    text: Some("Open".to_string()),
-                    enabled: true,
-                    item_type: "item".to_string(),
-                    predefined_type: None,
-                    submenu_items: None,
-                    checked: None,
-                    icon: None,
-                },
-            ]),
-            checked: None,
-            icon: None,
-        };
+        let item = make_submenu("submenu_1", "File", vec![
+            make_item("item_new", "New"),
+            make_item("item_open", "Open"),
+        ]);
         let result = menu_json_item_to_status_bar_item(item);
 
         assert_eq!(result.title, "File");
@@ -568,36 +609,9 @@ mod tests {
     #[test]
     fn test_separators_filtered_out() {
         let items = vec![
-            MenuJsonItem {
-                id: "item_1".to_string(),
-                text: Some("Copy".to_string()),
-                enabled: true,
-                item_type: "item".to_string(),
-                predefined_type: None,
-                submenu_items: None,
-                checked: None,
-                icon: None,
-            },
-            MenuJsonItem {
-                id: "sep_1".to_string(),
-                text: None,
-                enabled: false,
-                item_type: "predefined".to_string(),
-                predefined_type: Some("separator".to_string()),
-                submenu_items: None,
-                checked: None,
-                icon: None,
-            },
-            MenuJsonItem {
-                id: "item_2".to_string(),
-                text: Some("Paste".to_string()),
-                enabled: true,
-                item_type: "item".to_string(),
-                predefined_type: None,
-                submenu_items: None,
-                checked: None,
-                icon: None,
-            },
+            make_item("item_1", "Copy"),
+            make_separator("sep_1"),
+            make_item("item_2", "Paste"),
         ];
         let menu_items: Vec<_> = items
             .into_iter()
@@ -632,36 +646,9 @@ mod tests {
     #[test]
     fn test_split_items_into_groups_at_separator() {
         let items = vec![
-            MenuJsonItem {
-                id: "item_1".to_string(),
-                text: Some("Copy".to_string()),
-                enabled: true,
-                item_type: "item".to_string(),
-                predefined_type: None,
-                submenu_items: None,
-                checked: None,
-                icon: None,
-            },
-            MenuJsonItem {
-                id: "sep_1".to_string(),
-                text: None,
-                enabled: false,
-                item_type: "predefined".to_string(),
-                predefined_type: Some("separator".to_string()),
-                submenu_items: None,
-                checked: None,
-                icon: None,
-            },
-            MenuJsonItem {
-                id: "item_2".to_string(),
-                text: Some("Paste".to_string()),
-                enabled: true,
-                item_type: "item".to_string(),
-                predefined_type: None,
-                submenu_items: None,
-                checked: None,
-                icon: None,
-            },
+            make_item("item_1", "Copy"),
+            make_separator("sep_1"),
+            make_item("item_2", "Paste"),
         ];
         let groups = split_items_into_groups(items);
         assert_eq!(groups.len(), 2);
