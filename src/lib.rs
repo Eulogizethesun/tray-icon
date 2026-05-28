@@ -157,6 +157,45 @@ pub use muda::dpi;
 
 static COUNTER: Counter = Counter::new();
 
+/// QuickOperation configuration for OHOS left-click popup. **OHOS only**.
+///
+/// On OHOS, when a user left-clicks the tray icon, the system can show a popup panel
+/// rendered by a `StatusBarViewExtensionAbility`. This struct configures that popup.
+///
+/// On other platforms, this is silently ignored.
+#[derive(Debug, Clone)]
+pub struct QuickOperationConfig {
+    /// Popup title bar text. Overlong text shows ellipsis.
+    pub title: String,
+
+    /// Popup content area height in vp (must be > 0).
+    pub height: u32,
+
+    /// Name of the `StatusBarViewExtensionAbility` registered in `module.json5`.
+    /// Empty string disables the popup (left-click only fires `statusBarIconClick` event).
+    pub ability_name: String,
+
+    /// Module name where the ExtensionAbility is defined.
+    /// `None` uses the default module.
+    pub module_name: Option<String>,
+
+    /// Whether to show a loading animation.
+    /// Requires OHOS 6.0.0(20)+. `None` uses system default.
+    pub loading_status: Option<bool>,
+}
+
+impl Default for QuickOperationConfig {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            height: 200,
+            ability_name: String::new(),
+            module_name: None,
+            loading_status: None,
+        }
+    }
+}
+
 /// Attributes to use when creating a tray icon.
 pub struct TrayIconAttributes {
     /// Tray icon tooltip
@@ -212,6 +251,12 @@ pub struct TrayIconAttributes {
     ///   on the user's panel.  This may not be shown in all visualizations.
     /// - **Windows:** Unsupported.
     pub title: Option<String>,
+
+    /// QuickOperation configuration for left-click popup. **OHOS only**.
+    ///
+    /// On OHOS, configures the system popup panel shown when the user left-clicks
+    /// the tray icon. On other platforms, this field is silently ignored.
+    pub quick_operation: Option<QuickOperationConfig>,
 }
 
 impl Default for TrayIconAttributes {
@@ -225,6 +270,7 @@ impl Default for TrayIconAttributes {
             menu_on_left_click: true,
             menu_on_right_click: true,
             title: None,
+            quick_operation: None,
         }
     }
 }
@@ -331,6 +377,18 @@ impl TrayIconBuilder {
     /// - **Linux:** Unsupported.
     pub fn with_menu_on_right_click(mut self, enable: bool) -> Self {
         self.attrs.menu_on_right_click = enable;
+        self
+    }
+
+    /// Set QuickOperation for left-click popup. **OHOS only**.
+    ///
+    /// On OHOS, configures the system popup panel shown when the user left-clicks
+    /// the tray icon. The popup is rendered by a `StatusBarViewExtensionAbility`
+    /// that the application registers in `module.json5`.
+    ///
+    /// On other platforms, this is silently ignored.
+    pub fn with_quick_operation(mut self, config: QuickOperationConfig) -> Self {
+        self.attrs.quick_operation = Some(config);
         self
     }
 
@@ -511,9 +569,23 @@ impl TrayIcon {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
+    /// - **OHOS:** Unsupported. statusBarManager has no API to programmatically trigger the menu.
     pub fn show_menu(&self) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.tray.borrow().show_menu();
+    }
+
+    /// Set QuickOperation for left-click popup. **OHOS only**.
+    ///
+    /// On OHOS, configures the system popup panel shown when the user left-clicks
+    /// the tray icon. Pass `None` to disable the popup (left-click will only fire events).
+    ///
+    /// On other platforms, this is silently ignored.
+    pub fn set_quick_operation(&self, config: Option<QuickOperationConfig>) {
+        #[cfg(target_env = "ohos")]
+        self.tray.borrow_mut().set_quick_operation(config);
+        #[cfg(not(target_env = "ohos"))]
+        let _ = config;
     }
 
     /// Get tray icon rect.
@@ -747,5 +819,35 @@ mod tests {
                 }
             })
         )
+    }
+
+    #[test]
+    fn quick_operation_config_default() {
+        use super::*;
+        let config = QuickOperationConfig::default();
+        assert!(config.title.is_empty());
+        assert_eq!(config.height, 200);
+        assert!(config.ability_name.is_empty());
+        assert!(config.module_name.is_none());
+        assert!(config.loading_status.is_none());
+    }
+
+    #[test]
+    fn builder_with_quick_operation() {
+        use super::*;
+        let config = QuickOperationConfig {
+            title: "Test Title".into(),
+            height: 300,
+            ability_name: "TestAbility".into(),
+            module_name: Some("entry".into()),
+            loading_status: Some(true),
+        };
+        let builder = TrayIconBuilder::new().with_quick_operation(config);
+        let qo = builder.attrs.quick_operation.as_ref().unwrap();
+        assert_eq!(qo.title, "Test Title");
+        assert_eq!(qo.height, 300);
+        assert_eq!(qo.ability_name, "TestAbility");
+        assert_eq!(qo.module_name, Some("entry".into()));
+        assert_eq!(qo.loading_status, Some(true));
     }
 }

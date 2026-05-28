@@ -39,28 +39,9 @@ impl TrayIcon {
     pub fn new(id: TrayIconId, attrs: TrayIconAttributes) -> crate::Result<Self> {
         let app = get_ohos_app();
 
-        let icon = attrs.icon.as_ref().ok_or_else(|| {
-            crate::Error::OsError(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "No icon provided",
-            ))
-        })?;
-
-        let status_bar_icon = icon::icon_to_status_bar_icon(&icon.inner)?;
-
-        let quick_operation = openharmony_ability::statusbar::QuickOperation {
-            ability_name: String::new(),
-            title: attrs
-                .title
-                .clone()
-                .unwrap_or_else(|| "Tauri App".to_string()),
-            height: 200,
-            module_name: Some("entry".to_string()),
-            loading_status: None,
-        };
-
-        let (menus, predefined_map, check_state, menu_json) =
-            menu_to_status_bar_items_with_metadata(&attrs.menu);
+        // Extract metadata before building the item (menus may be consumed)
+        let (predefined_map, check_state, menu_json) =
+            extract_menu_metadata(&attrs.menu);
 
         {
             let mut metadata = MENU_METADATA.lock().unwrap();
@@ -69,12 +50,7 @@ impl TrayIcon {
             metadata.menu_json = menu_json;
         }
 
-        let item = openharmony_ability::statusbar::StatusBarItem {
-            icons: status_bar_icon,
-            quick_operation,
-            status_bar_group_menu: menus,
-            hover_tips: attrs.tooltip.clone().filter(|s| !s.is_empty()),
-        };
+        let item = build_item_from_attrs(&attrs)?;
 
         openharmony_ability::statusbar::add_to_status_bar(app, &item)
             .map_err(|e| crate::Error::OhosError(e.to_string()))?;
@@ -181,6 +157,22 @@ impl TrayIcon {
         Ok(())
     }
 
+    pub fn set_quick_operation(&mut self, config: Option<crate::QuickOperationConfig>) {
+        self.attrs.borrow_mut().quick_operation = config;
+        if *self.is_visible.borrow() {
+            let app = get_ohos_app();
+            openharmony_ability::statusbar::remove_from_status_bar(app)
+                .map_err(|e| log::warn!("[TrayIcon] remove error in set_quick_operation: {}", e))
+                .ok();
+            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
+            if let Some(item) = item {
+                openharmony_ability::statusbar::add_to_status_bar(app, &item)
+                    .map_err(|e| log::warn!("[TrayIcon] add error in set_quick_operation: {}", e))
+                    .ok();
+            }
+        }
+    }
+
     pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {}
 
     // OHOS: rect() always returns None.
@@ -228,6 +220,32 @@ fn menu_to_status_bar_items(
             }
         }
     })
+}
+
+/// Extract menu metadata (predefined_map, check_state, menu_json) without
+/// converting to StatusBarMenuItem. Used by `new()` which delegates the
+/// conversion to `build_item_from_attrs()`.
+fn extract_menu_metadata(
+    menu: &Option<Box<dyn crate::menu::ContextMenu>>,
+) -> (
+    HashMap<String, String>,
+    HashMap<String, bool>,
+    Option<String>,
+) {
+    let Some(m) = menu.as_ref() else {
+        return (HashMap::new(), HashMap::new(), None);
+    };
+    let json = m.ohos_context_menu();
+    let items: Vec<MenuJsonItem> = serde_json::from_str(&json).unwrap_or_default();
+    if items.is_empty() {
+        return (HashMap::new(), HashMap::new(), None);
+    }
+
+    let mut predefined_map = HashMap::new();
+    let mut check_state = HashMap::new();
+    collect_metadata_from_items(&items, &mut predefined_map, &mut check_state);
+
+    (predefined_map, check_state, Some(json))
 }
 
 fn menu_to_status_bar_items_with_metadata(
@@ -342,6 +360,7 @@ fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct MenuJsonItem {
     id: String,
     #[serde(default)]
@@ -365,6 +384,7 @@ pub(crate) struct MenuJsonItem {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct AboutMetadataJson {
     #[serde(default)]
     name: Option<String>,
@@ -504,15 +524,29 @@ fn build_item_from_attrs(
 
     let status_bar_icon = icon::icon_to_status_bar_icon(&icon.inner)?;
 
-    let quick_operation = openharmony_ability::statusbar::QuickOperation {
-        ability_name: String::new(),
-        title: attrs
-            .title
-            .clone()
-            .unwrap_or_else(|| "Tauri App".to_string()),
-        height: 200,
-        module_name: Some("entry".to_string()),
-        loading_status: None,
+    let quick_operation = if let Some(ref config) = attrs.quick_operation {
+        openharmony_ability::statusbar::QuickOperation {
+            ability_name: config.ability_name.clone(),
+            title: if config.title.is_empty() {
+                attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+            } else {
+                config.title.clone()
+            },
+            height: config.height,
+            module_name: config.module_name.clone(),
+            loading_status: config.loading_status,
+        }
+    } else {
+        openharmony_ability::statusbar::QuickOperation {
+            ability_name: String::new(),
+            title: attrs
+                .title
+                .clone()
+                .unwrap_or_else(|| "Tauri App".to_string()),
+            height: 200,
+            module_name: Some("entry".to_string()),
+            loading_status: None,
+        }
     };
 
     let menus = menu_to_status_bar_items(&attrs.menu);
@@ -656,5 +690,109 @@ mod tests {
         assert_eq!(groups[0][0].title, "Copy");
         assert_eq!(groups[1].len(), 1);
         assert_eq!(groups[1][0].title, "Paste");
+    }
+
+    #[test]
+    fn build_item_with_quick_operation() {
+        use crate::QuickOperationConfig;
+        let mut attrs = TrayIconAttributes::default();
+        attrs.quick_operation = Some(QuickOperationConfig {
+            title: "My Panel".into(),
+            height: 300,
+            ability_name: "MyAbility".into(),
+            module_name: Some("entry".into()),
+            loading_status: Some(true),
+        });
+
+        // Verify the QuickOperation struct that build_item_from_attrs would create
+        let config = attrs.quick_operation.as_ref().unwrap();
+        let qo = openharmony_ability::statusbar::QuickOperation {
+            ability_name: config.ability_name.clone(),
+            title: if config.title.is_empty() {
+                attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+            } else {
+                config.title.clone()
+            },
+            height: config.height,
+            module_name: config.module_name.clone(),
+            loading_status: config.loading_status,
+        };
+
+        assert_eq!(qo.ability_name, "MyAbility");
+        assert_eq!(qo.title, "My Panel");
+        assert_eq!(qo.height, 300);
+        assert_eq!(qo.module_name, Some("entry".into()));
+        assert_eq!(qo.loading_status, Some(true));
+    }
+
+    #[test]
+    fn build_item_without_quick_operation() {
+        let mut attrs = TrayIconAttributes::default();
+        attrs.title = Some("My App".into());
+        // quick_operation is None by default
+
+        // Verify the default QuickOperation struct that build_item_from_attrs would create
+        let qo = openharmony_ability::statusbar::QuickOperation {
+            ability_name: String::new(),
+            title: attrs
+                .title
+                .clone()
+                .unwrap_or_else(|| "Tauri App".to_string()),
+            height: 200,
+            module_name: Some("entry".to_string()),
+            loading_status: None,
+        };
+
+        assert!(qo.ability_name.is_empty());
+        assert_eq!(qo.title, "My App");
+        assert_eq!(qo.height, 200);
+        assert_eq!(qo.module_name, Some("entry".to_string()));
+        assert!(qo.loading_status.is_none());
+    }
+
+    #[test]
+    fn quick_operation_empty_title_falls_back_to_attrs_title() {
+        use crate::QuickOperationConfig;
+        let mut attrs = TrayIconAttributes::default();
+        attrs.title = Some("App Title".into());
+        attrs.quick_operation = Some(QuickOperationConfig {
+            title: String::new(), // empty → should fall back to attrs.title
+            height: 250,
+            ability_name: "TestAbility".into(),
+            module_name: None,
+            loading_status: None,
+        });
+
+        let config = attrs.quick_operation.as_ref().unwrap();
+        let title = if config.title.is_empty() {
+            attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+        } else {
+            config.title.clone()
+        };
+
+        assert_eq!(title, "App Title");
+    }
+
+    #[test]
+    fn quick_operation_no_attrs_title_falls_back_to_default() {
+        use crate::QuickOperationConfig;
+        let mut attrs = TrayIconAttributes::default();
+        // attrs.title is None
+        attrs.quick_operation = Some(QuickOperationConfig {
+            title: String::new(), // empty
+            height: 250,
+            ability_name: "TestAbility".into(),
+            module_name: None,
+            loading_status: None,
+        });
+
+        let config = attrs.quick_operation.as_ref().unwrap();
+        let title = if config.title.is_empty() {
+            attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+        } else {
+            config.title.clone()
+        };
+
+        assert_eq!(title, "Tauri App");
     }
 }
