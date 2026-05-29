@@ -20,6 +20,7 @@ pub(crate) struct MenuMetadata {
     pub predefined_map: HashMap<String, String>,
     pub check_state: HashMap<String, bool>,
     pub menu_json: Option<String>,
+    pub flat_ids: Vec<String>,
 }
 
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
@@ -50,7 +51,12 @@ impl TrayIcon {
             metadata.menu_json = menu_json;
         }
 
-        let item = build_item_from_attrs(&attrs)?;
+        let mut item = build_item_from_attrs(&attrs)?;
+
+        if let Some(ref mut groups) = item.status_bar_group_menu {
+            let flat_ids = remap_menu_codes_to_indices(groups);
+            MENU_METADATA.lock().unwrap().flat_ids = flat_ids;
+        }
 
         openharmony_ability::statusbar::add_to_status_bar(app, &item)
             .map_err(|e| crate::Error::OhosError(e.to_string()))?;
@@ -92,7 +98,9 @@ impl TrayIcon {
             metadata.menu_json = menu_json;
         }
 
-        if let Some(m) = menus {
+        if let Some(mut m) = menus {
+            let flat_ids = remap_menu_codes_to_indices(&mut m);
+            MENU_METADATA.lock().unwrap().flat_ids = flat_ids;
             openharmony_ability::statusbar::update_status_bar_menu(app, &m)
                 .map_err(|e| crate::Error::OhosError(e.to_string()))
                 .ok();
@@ -327,6 +335,41 @@ pub(crate) fn split_items_into_groups(
     }
 
     groups
+}
+
+/// Replace all menuCode values with sequential numeric strings ("0", "1", ...).
+/// Returns the flat_ids mapping: index → our original string ID.
+pub(crate) fn remap_menu_codes_to_indices(
+    groups: &mut [Vec<openharmony_ability::statusbar::StatusBarMenuItem>],
+) -> Vec<String> {
+    let mut flat_ids = Vec::new();
+    let mut idx: usize = 0;
+    for group in groups.iter_mut() {
+        for item in group.iter_mut() {
+            if let Some(ref code) = item.menu_code {
+                flat_ids.push(code.clone());
+                let num = idx.to_string();
+                item.menu_code = Some(num.clone());
+                if let Some(ref mut action) = item.menu_action {
+                    action.menu_code = Some(num);
+                }
+                idx += 1;
+            }
+            if let Some(ref mut sub_menu) = item.sub_menu {
+                for sub in sub_menu.iter_mut() {
+                    if let Some(ref code) = sub.menu_code {
+                        flat_ids.push(code.clone());
+                        let num = idx.to_string();
+                        sub.menu_code = Some(num.clone());
+                        sub.menu_action.menu_code = Some(num);
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+    log::debug!("[TrayIcon] remap_menu_codes: {} items → {:?}", idx, flat_ids);
+    flat_ids
 }
 
 fn strip_mnemonics(text: &str) -> String {
