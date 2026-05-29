@@ -12,23 +12,28 @@ use crate::{
     dpi::PhysicalPosition, MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId,
 };
 use crossbeam_channel::select;
-use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 use std::thread;
 
 use super::MENU_METADATA;
 
 static EVENT_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
-static TRAY_ID: OnceCell<TrayIconId> = OnceCell::new();
+// RwLock instead of OnceCell: OHOS allows only one tray at a time (singleton),
+// but multiple trays may be created/destroyed over the app lifetime.
+// Each new tray must update TRAY_ID so events carry the correct ID.
+static TRAY_ID: RwLock<Option<TrayIconId>> = RwLock::new(None);
 
 pub fn register_tray_id(id: TrayIconId) {
-    TRAY_ID.set(id).ok();
+    let mut guard = TRAY_ID.write().unwrap();
+    *guard = Some(id);
 }
 
 pub fn get_current_tray_id() -> TrayIconId {
     TRAY_ID
-        .get()
-        .cloned()
+        .read()
+        .unwrap()
+        .clone()
         .unwrap_or_else(|| TrayIconId::new("main"))
 }
 
@@ -51,10 +56,12 @@ pub fn start_event_forward_thread() {
                 },
                 recv(menu_receiver) -> event => {
                     if let Ok(status_bar_event) = event {
-                        let menu_code = match &status_bar_event {
+                        let raw_code = match &status_bar_event {
                             openharmony_ability::statusbar::StatusBarClickEvent::MenuClick { menu_code } => menu_code.clone(),
                             _ => String::new(),
                         };
+
+                        let menu_code = translate_menu_code(&raw_code);
 
                         let action = {
                             let metadata = MENU_METADATA.lock().unwrap();
@@ -75,13 +82,11 @@ pub fn start_event_forward_thread() {
                             MenuAction::Check(code) => {
                                 log::debug!("[TrayIcon] menu click → check toggle: {}", code);
                                 toggle_check_item(&code);
-                                let tray_event = convert_menu_click(status_bar_event);
-                                TrayIconEvent::send(tray_event);
+                                openharmony_ability::send_menu_event(code);
                             }
                             MenuAction::Regular => {
                                 log::debug!("[TrayIcon] menu click → regular: {}", menu_code);
-                                let tray_event = convert_menu_click(status_bar_event);
-                                TrayIconEvent::send(tray_event);
+                                openharmony_ability::send_menu_event(menu_code);
                             }
                         }
                     }
@@ -169,7 +174,10 @@ fn rebuild_and_update_menu(json: &str) {
         Err(_) => return,
     };
 
-    let groups = super::split_items_into_groups(menu_items);
+    let mut groups = super::split_items_into_groups(menu_items);
+
+    let flat_ids = super::remap_menu_codes_to_indices(&mut groups);
+    MENU_METADATA.lock().unwrap().flat_ids = flat_ids;
 
     if !groups.is_empty() {
         let app = super::get_ohos_app();
@@ -189,28 +197,21 @@ fn convert_icon_click(
     }
 }
 
-fn convert_menu_click(
-    event: openharmony_ability::statusbar::StatusBarClickEvent,
-) -> TrayIconEvent {
-    let menu_code = match event {
-        openharmony_ability::statusbar::StatusBarClickEvent::MenuClick { menu_code } => menu_code,
-        _ => String::new(),
-    };
+/// Translate a system-returned numeric menuCode back to our original string ID.
+fn translate_menu_code(raw_code: &str) -> String {
+    let metadata = MENU_METADATA.lock().unwrap();
 
-    // Encode menu_code into the id so it can be retrieved by the application
-    let base_id = get_current_tray_id();
-    let id = if menu_code.is_empty() {
-        base_id
-    } else {
-        TrayIconId::new(format!("{}:{}", base_id.0, menu_code))
-    };
+    if metadata.flat_ids.is_empty() {
+        return raw_code.to_string();
+    }
 
-    TrayIconEvent::Click {
-        id,
-        position: PhysicalPosition::new(0.0, 0.0),
-        rect: Rect::default(),
-        button: MouseButton::Right,
-        button_state: MouseButtonState::Up,
+    match raw_code.parse::<usize>() {
+        Ok(idx) if idx < metadata.flat_ids.len() => {
+            let translated = metadata.flat_ids[idx].clone();
+            log::debug!("[TrayIcon] translate: '{}' → '{}' (index {})", raw_code, translated, idx);
+            translated
+        }
+        _ => raw_code.to_string(),
     }
 }
 
@@ -235,33 +236,6 @@ mod tests {
             } => {
                 assert_eq!(id.0, get_current_tray_id().0);
                 assert_eq!(button, MouseButton::Left);
-                assert_eq!(button_state, MouseButtonState::Up);
-                assert_eq!(position.x, 0.0);
-                assert_eq!(position.y, 0.0);
-                assert_eq!(rect.position.x, 0.0);
-                assert_eq!(rect.size.width, 0);
-            }
-            _ => panic!("unexpected event type"),
-        }
-    }
-
-    #[test]
-    fn test_menu_click_conversion() {
-        let event = openharmony_ability::statusbar::StatusBarClickEvent::MenuClick {
-            menu_code: "item_0".to_string(),
-        };
-        let tray_event = convert_menu_click(event);
-
-        match tray_event {
-            TrayIconEvent::Click {
-                id,
-                button,
-                button_state,
-                position,
-                rect,
-            } => {
-                assert!(id.0.contains("item_0"));
-                assert_eq!(button, MouseButton::Right);
                 assert_eq!(button_state, MouseButtonState::Up);
                 assert_eq!(position.x, 0.0);
                 assert_eq!(position.y, 0.0);
