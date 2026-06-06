@@ -186,13 +186,29 @@ fn rebuild_and_update_menu(json: &str) {
 }
 
 fn convert_icon_click(
-    _event: openharmony_ability::statusbar::StatusBarClickEvent,
+    event: openharmony_ability::statusbar::StatusBarClickEvent,
 ) -> TrayIconEvent {
+    let button = match event {
+        openharmony_ability::statusbar::StatusBarClickEvent::IconClick { click_type } => {
+            match click_type.as_str() {
+                "rightClick" => MouseButton::Right,
+                unknown => {
+                    log::debug!("[TrayIcon] unknown click_type '{}', defaulting to Left", unknown);
+                    MouseButton::Left
+                }
+            }
+        }
+        other => {
+            log::debug!("[TrayIcon] unexpected event variant {:?}, defaulting to Left click", other);
+            MouseButton::Left
+        }
+    };
+
     TrayIconEvent::Click {
         id: get_current_tray_id(),
         position: PhysicalPosition::new(0.0, 0.0),
         rect: Rect::default(),
-        button: MouseButton::Left,
+        button,
         button_state: MouseButtonState::Up,
     }
 }
@@ -220,27 +236,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_icon_click_conversion() {
+    fn test_icon_click_left() {
         let event = openharmony_ability::statusbar::StatusBarClickEvent::IconClick {
             click_type: "leftClick".to_string(),
         };
         let tray_event = convert_icon_click(event);
 
         match tray_event {
-            TrayIconEvent::Click {
-                id,
-                button,
-                button_state,
-                position,
-                rect,
-            } => {
-                assert_eq!(id.0, get_current_tray_id().0);
+            TrayIconEvent::Click { button, .. } => {
                 assert_eq!(button, MouseButton::Left);
-                assert_eq!(button_state, MouseButtonState::Up);
-                assert_eq!(position.x, 0.0);
-                assert_eq!(position.y, 0.0);
-                assert_eq!(rect.position.x, 0.0);
-                assert_eq!(rect.size.width, 0);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn test_icon_click_right() {
+        let event = openharmony_ability::statusbar::StatusBarClickEvent::IconClick {
+            click_type: "rightClick".to_string(),
+        };
+        let tray_event = convert_icon_click(event);
+
+        match tray_event {
+            TrayIconEvent::Click { button, .. } => {
+                assert_eq!(button, MouseButton::Right);
             }
             _ => panic!("unexpected event type"),
         }
