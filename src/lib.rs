@@ -354,7 +354,13 @@ impl TrayIconBuilder {
         self
     }
 
-    /// Use the icon as a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc). **macOS only**.
+    /// Use the icon as a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc).
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **macOS**: Template image rendered by system based on appearance (dark/light mode).
+    /// - **OHOS**: Generates white and black versions from alpha mask; system selects based on wallpaper color.
+    /// - **Windows / Linux**: Unsupported.
     pub fn with_icon_as_template(mut self, is_template: bool) -> Self {
         self.attrs.icon_is_template = is_template;
         self
@@ -515,21 +521,29 @@ impl TrayIcon {
         let _ = path;
     }
 
-    /// Set the current icon as a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc). **macOS only**.
+    /// Set the current icon as a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc).
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **macOS**: Template image rendered by system based on appearance (dark/light mode).
+    /// - **OHOS**: Generates white and black versions from alpha mask; system selects based on wallpaper color.
+    /// - **Windows / Linux**: Unsupported.
     pub fn set_icon_as_template(&self, is_template: bool) {
         #[cfg(target_os = "macos")]
         self.tray.borrow_mut().set_icon_as_template(is_template);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_env = "ohos")]
+        let _ = self.tray.borrow_mut().set_icon_as_template(is_template);
+        #[cfg(not(any(target_os = "macos", target_env = "ohos")))]
         let _ = is_template;
     }
 
     pub fn set_icon_with_as_template(&self, icon: Option<Icon>, is_template: bool) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_env = "ohos"))]
         return self
             .tray
             .borrow_mut()
             .set_icon_with_as_template(icon, is_template);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_env = "ohos")))]
         {
             let _ = icon;
             let _ = is_template;
