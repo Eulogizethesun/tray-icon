@@ -72,8 +72,9 @@ impl TrayIcon {
 
     pub fn set_icon(&mut self, icon: Option<crate::Icon>) -> crate::Result<()> {
         let app = get_ohos_app();
+        let is_template = self.attrs.borrow().icon_is_template;
         if let Some(i) = &icon {
-            let status_bar_icon = icon::icon_to_status_bar_icon(&i.inner)?;
+            let status_bar_icon = icon::icon_to_status_bar_icon(&i.inner, is_template)?;
             openharmony_ability::statusbar::update_status_bar_icon(app, &status_bar_icon)
                 .map_err(|e| crate::Error::OhosError(e.to_string()))?;
         } else {
@@ -182,6 +183,33 @@ impl TrayIcon {
     }
 
     pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {}
+
+    pub fn set_icon_as_template(&mut self, is_template: bool) -> crate::Result<()> {
+        // No-op if value unchanged — avoids unnecessary remove+re-add
+        if self.attrs.borrow().icon_is_template == is_template {
+            return Ok(());
+        }
+        self.attrs.borrow_mut().icon_is_template = is_template;
+        if *self.is_visible.borrow() {
+            let app = get_ohos_app();
+            openharmony_ability::statusbar::remove_from_status_bar(app)
+                .map_err(|e| log::warn!("[TrayIcon] remove error in set_icon_as_template: {}", e))
+                .ok();
+            let item = build_item_from_attrs(&self.attrs.borrow())?;
+            openharmony_ability::statusbar::add_to_status_bar(app, &item)
+                .map_err(|e| crate::Error::OhosError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn set_icon_with_as_template(
+        &mut self,
+        icon: Option<crate::Icon>,
+        is_template: bool,
+    ) -> crate::Result<()> {
+        self.attrs.borrow_mut().icon_is_template = is_template;
+        self.set_icon(icon)
+    }
 
     // OHOS: rect() always returns None.
     // StatusBar API does not provide tray icon position or dimensions.
@@ -565,7 +593,7 @@ fn build_item_from_attrs(
         ))
     })?;
 
-    let status_bar_icon = icon::icon_to_status_bar_icon(&icon.inner)?;
+    let status_bar_icon = icon::icon_to_status_bar_icon(&icon.inner, attrs.icon_is_template)?;
 
     let quick_operation = if let Some(ref config) = attrs.quick_operation {
         openharmony_ability::statusbar::QuickOperation {
@@ -837,5 +865,59 @@ mod tests {
         };
 
         assert_eq!(title, "Tauri App");
+    }
+
+    #[test]
+    fn test_icon_is_template_default_false() {
+        let attrs = TrayIconAttributes::default();
+        assert_eq!(attrs.icon_is_template, false);
+    }
+
+    #[test]
+    fn test_build_item_from_attrs_template_mode() {
+        use crate::icon::Icon;
+
+        // Create a simple 2x2 red icon
+        let rgba = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 128, 128, 128];
+        let icon = Icon::from_rgba(rgba, 2, 2).unwrap();
+
+        let mut attrs = TrayIconAttributes::default();
+        attrs.icon = Some(icon);
+        attrs.icon_is_template = true;
+
+        let item = build_item_from_attrs(&attrs).unwrap();
+        let white = item.icons.white.borrow().clone().unwrap();
+        let black = item.icons.black.borrow().clone().unwrap();
+
+        // Template mode: white and black should differ
+        assert_ne!(white, black);
+        // White version: RGB=255
+        assert_eq!(white[0], 255);
+        assert_eq!(white[1], 255);
+        assert_eq!(white[2], 255);
+        // Black version: RGB=0
+        assert_eq!(black[0], 0);
+        assert_eq!(black[1], 0);
+        assert_eq!(black[2], 0);
+    }
+
+    #[test]
+    fn test_build_item_from_attrs_not_template() {
+        use crate::icon::Icon;
+
+        let rgba = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 128, 128, 128];
+        let icon = Icon::from_rgba(rgba.clone(), 2, 2).unwrap();
+
+        let mut attrs = TrayIconAttributes::default();
+        attrs.icon = Some(icon);
+        attrs.icon_is_template = false;
+
+        let item = build_item_from_attrs(&attrs).unwrap();
+        let white = item.icons.white.borrow().clone().unwrap();
+        let black = item.icons.black.borrow().clone().unwrap();
+
+        // Not template: white and black should be the same original image
+        assert_eq!(white, black);
+        assert_eq!(white, rgba);
     }
 }

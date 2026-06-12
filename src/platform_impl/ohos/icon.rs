@@ -29,6 +29,7 @@ impl PlatformIcon {
 
 pub fn icon_to_status_bar_icon(
     icon: &PlatformIcon,
+    is_template: bool,
 ) -> crate::Result<openharmony_ability::statusbar::StatusBarIcon> {
     let rgba = &icon.rgba;
     let (width, height) = (icon.width, icon.height);
@@ -40,11 +41,50 @@ pub fn icon_to_status_bar_icon(
         rgba.clone()
     };
 
+    let (white, black) = if is_template {
+        (
+            RefCell::new(Some(to_monochrome(&scaled_rgba, 255))),
+            RefCell::new(Some(to_monochrome(&scaled_rgba, 0))),
+        )
+    } else {
+        (
+            RefCell::new(Some(scaled_rgba.clone())),
+            RefCell::new(Some(scaled_rgba)),
+        )
+    };
+
     Ok(openharmony_ability::statusbar::StatusBarIcon {
-        white: RefCell::new(Some(scaled_rgba.clone())),
-        black: RefCell::new(Some(scaled_rgba)),
+        white,
+        black,
         size,
     })
+}
+
+/// Convert icon to a monochrome alpha mask, matching macOS NSImage template semantics.
+///
+/// On macOS, template images use the alpha channel as a mask and the system
+/// applies a tint color. On OHOS, we simulate this by generating solid-color
+/// silhouettes where the alpha channel defines the shape.
+///
+/// Semi-transparent pixels (anti-aliased edges) are thresholded to avoid
+/// visible gray halos when the system renders against contrasting backgrounds.
+fn to_monochrome(rgba: &[u8], color: u8) -> Vec<u8> {
+    // Alpha threshold: pixels below this become fully transparent,
+    // pixels at or above become fully opaque. This eliminates semi-transparent
+    // edge pixels that cause gray halos on OHOS (where the system alpha-blends
+    // white [255,255,255,N<255] against dark backgrounds).
+    const ALPHA_THRESHOLD: u8 = 128;
+
+    rgba.chunks(4)
+        .flat_map(|pixel| {
+            let a = pixel[3];
+            if a < ALPHA_THRESHOLD {
+                [0, 0, 0, 0]
+            } else {
+                [color, color, color, 255]
+            }
+        })
+        .collect()
 }
 
 
@@ -102,6 +142,71 @@ mod tests {
         assert_eq!(scaled[1], 100);
         assert_eq!(scaled[2], 100);
         assert_eq!(scaled[3], 255);
+    }
+
+    #[test]
+    fn test_to_monochrome_white_threshold() {
+        let rgba = vec![
+            255, 0, 0, 255,    // red, opaque → white, opaque
+            0, 128, 255, 128,  // blue, alpha=128 (at threshold) → white, opaque
+            0, 0, 0, 127,      // alpha=127 (below threshold) → transparent
+            0, 0, 0, 0,        // transparent → transparent
+        ];
+        let white = to_monochrome(&rgba, 255);
+        assert_eq!(white, vec![
+            255, 255, 255, 255,
+            255, 255, 255, 255,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+        ]);
+    }
+
+    #[test]
+    fn test_to_monochrome_black_threshold() {
+        let rgba = vec![
+            255, 255, 255, 200, // white pixel, alpha=200 → black, opaque
+            50, 100, 150, 64,   // colored pixel, alpha=64 → transparent
+        ];
+        let black = to_monochrome(&rgba, 0);
+        assert_eq!(black, vec![
+            0, 0, 0, 255,
+            0, 0, 0, 0,
+        ]);
+    }
+
+    #[test]
+    fn test_icon_to_status_bar_icon_template_different() {
+        let icon = PlatformIcon {
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 128, 128, 128, 64],
+            width: 2,
+            height: 2,
+        };
+        let result = icon_to_status_bar_icon(&icon, true).unwrap();
+        let white = result.white.borrow().clone().unwrap();
+        let black = result.black.borrow().clone().unwrap();
+        // White version: all RGB=255, alpha thresholded to 255
+        assert_eq!(white[0], 255); assert_eq!(white[1], 255); assert_eq!(white[2], 255); assert_eq!(white[3], 255);
+        assert_eq!(white[4], 255); assert_eq!(white[5], 255); assert_eq!(white[6], 255); assert_eq!(white[7], 255);
+        // Black version: all RGB=0, alpha thresholded to 255
+        assert_eq!(black[0], 0); assert_eq!(black[1], 0); assert_eq!(black[2], 0); assert_eq!(black[3], 255);
+        assert_eq!(black[4], 0); assert_eq!(black[5], 0); assert_eq!(black[6], 0); assert_eq!(black[7], 255);
+        // They should be different
+        assert_ne!(white, black);
+    }
+
+    #[test]
+    fn test_icon_to_status_bar_icon_not_template_same() {
+        let icon = PlatformIcon {
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 128, 128, 128, 64],
+            width: 2,
+            height: 2,
+        };
+        let result = icon_to_status_bar_icon(&icon, false).unwrap();
+        let white = result.white.borrow().clone().unwrap();
+        let black = result.black.borrow().clone().unwrap();
+        // Both should be the original image
+        assert_eq!(white, black);
+        assert_eq!(white, icon.rgba);
     }
 
     }
