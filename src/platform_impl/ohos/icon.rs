@@ -30,11 +30,28 @@ impl PlatformIcon {
 pub fn icon_to_status_bar_icon(
     icon: &PlatformIcon,
     is_template: bool,
-) -> crate::Result<openharmony_ability::statusbar::StatusBarIcon> {
+) -> crate::Result<openharmony_ability_plugin_statusbar::StatusBarIcon> {
     let rgba = &icon.rgba;
     let (width, height) = (icon.width, icon.height);
 
-    let size = width.min(height);
+    // OHOS `statusBarManager.addToStatusBar` rejects icon PixelMaps whose
+    // dimensions don't match the device's density-corrected status-bar slot
+    // (24vp × display density, in physical px) — logged as "The size of the
+    // pixelmap exceeds the limit." and surfaced as a fatal 401 "check param
+    // error". A fixed 24px/32px PixelMap fails on a 2-in-1 (e.g. 304 DPI →
+    // density 1.9 → 24vp ≈ 46px). Density is only queryable on the ArkTS side,
+    // so Rust passes the source at its native size (capped for memory safety
+    // only); the ArkTS helper `createPixelMapFromRgba` queries the display
+    // density and scales the PixelMap to the correct slot. See spec §7.4.
+    const MAX_STATUS_BAR_ICON_EDGE: u32 = 256;
+
+    let size = width.min(height).min(MAX_STATUS_BAR_ICON_EDGE);
+    log::debug!(
+        "[TrayIcon] icon_to_status_bar_icon: src={}x{} -> status_bar_size={}",
+        width,
+        height,
+        size
+    );
     let scaled_rgba = if width != size || height != size {
         scale_rgba(rgba, width, height, size, size)
     } else {
@@ -53,7 +70,7 @@ pub fn icon_to_status_bar_icon(
         )
     };
 
-    Ok(openharmony_ability::statusbar::StatusBarIcon {
+    Ok(openharmony_ability_plugin_statusbar::StatusBarIcon {
         white,
         black,
         size,
@@ -207,6 +224,106 @@ mod tests {
         // Both should be the original image
         assert_eq!(white, black);
         assert_eq!(white, icon.rgba);
+    }
+
+    #[test]
+    fn test_platform_icon_from_rgba_dimension_mismatch() {
+        // 4 pixels = 16 bytes, but width*height says 3 pixels
+        let result = PlatformIcon::from_rgba(vec![255; 16], 3, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_platform_icon_from_rgba_valid() {
+        let rgba = vec![255; 16]; // 4 pixels, 2x2
+        let result = PlatformIcon::from_rgba(rgba, 2, 2);
+        assert!(result.is_ok());
+        let icon = result.unwrap();
+        assert_eq!(icon.width, 2);
+        assert_eq!(icon.height, 2);
+        assert_eq!(icon.rgba.len(), 16);
+    }
+
+    #[test]
+    fn test_scale_rgba_upsample() {
+        // Upsample 1x1 to 2x2
+        let rgba = vec![10, 20, 30, 40];
+        let scaled = scale_rgba(&rgba, 1, 1, 2, 2);
+        assert_eq!(scaled.len(), 16); // 4 pixels * 4 bytes
+        // Nearest neighbor: all pixels are the source pixel
+        for i in (0..16).step_by(4) {
+            assert_eq!(scaled[i], 10);
+            assert_eq!(scaled[i + 1], 20);
+            assert_eq!(scaled[i + 2], 30);
+            assert_eq!(scaled[i + 3], 40);
+        }
+    }
+
+    #[test]
+    fn test_scale_rgba_uneven_dimensions() {
+        // Scale 4x1 to 2x1 (horizontal downsample)
+        let rgba = vec![
+            10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255,
+        ];
+        let scaled = scale_rgba(&rgba, 4, 1, 2, 1);
+        assert_eq!(scaled.len(), 8);
+        // Nearest neighbor: dst_x=0 → src_x=0, dst_x=1 → src_x=2
+        assert_eq!(scaled[0], 10);
+        assert_eq!(scaled[4], 30);
+    }
+
+    #[test]
+    fn test_to_monochrome_boundary_alpha_127_below_threshold() {
+        // Alpha 127 is below threshold (128) → transparent
+        let rgba = vec![255, 0, 0, 127];
+        let white = to_monochrome(&rgba, 255);
+        assert_eq!(white, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_to_monochrome_boundary_alpha_128_at_threshold() {
+        // Alpha 128 is at threshold → opaque
+        let rgba = vec![255, 0, 0, 128];
+        let white = to_monochrome(&rgba, 255);
+        assert_eq!(white, vec![255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_to_monochrome_empty_input() {
+        let rgba: Vec<u8> = vec![];
+        let white = to_monochrome(&rgba, 255);
+        assert!(white.is_empty());
+    }
+
+    #[test]
+    fn test_icon_to_status_bar_icon_large_icon_scales_down() {
+        // Create a 300x300 icon — should be capped to 256
+        let rgba = vec![255u8; 300 * 300 * 4];
+        let icon = PlatformIcon {
+            rgba,
+            width: 300,
+            height: 300,
+        };
+        let result = icon_to_status_bar_icon(&icon, false).unwrap();
+        assert_eq!(result.size, 256);
+        let white = result.white.borrow().clone().unwrap();
+        // Scaled to 256x256
+        assert_eq!(white.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn test_icon_to_status_bar_icon_non_square_scales_to_min() {
+        // 48x32 icon: min(48, 32, 256) = 32 → scaled to 32x32
+        let rgba = vec![128u8; 48 * 32 * 4];
+        let icon = PlatformIcon {
+            rgba,
+            width: 48,
+            height: 32,
+        };
+        let result = icon_to_status_bar_icon(&icon, false).unwrap();
+        assert_eq!(result.size, 32);
+        let white = result.white.borrow().clone().unwrap();
+        assert_eq!(white.len(), 32 * 32 * 4);
     }
 
     }

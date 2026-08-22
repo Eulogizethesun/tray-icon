@@ -11,10 +11,13 @@
 use crate::{
     dpi::PhysicalPosition, MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId,
 };
-use crossbeam_channel::select;
+use crossbeam_channel::{select, Receiver, Sender};
+use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::thread;
+
+use openharmony_ability_plugin_statusbar::StatusBarClickEvent;
 
 use super::MENU_METADATA;
 
@@ -23,6 +26,34 @@ static EVENT_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 // but multiple trays may be created/destroyed over the app lifetime.
 // Each new tray must update TRAY_ID so events carry the correct ID.
 static TRAY_ID: RwLock<Option<TrayIconId>> = RwLock::new(None);
+
+// ─── Local event channels (owned by tray-icon) ──────────────────────────────
+// tray-icon owns the ICON_CLICK_CHANNEL / MENU_CLICK_CHANNEL. The Senders are
+// registered with plugin-statusbar (via register_icon_click_sender /
+// register_menu_click_sender) so on_main_thread_event forwards decoded events
+// here. start_event_forward_thread consumes from the local receivers.
+
+static ICON_CLICK_CHANNEL: Lazy<(Sender<StatusBarClickEvent>, Receiver<StatusBarClickEvent>)> =
+    Lazy::new(crossbeam_channel::unbounded);
+static MENU_CLICK_CHANNEL: Lazy<(Sender<StatusBarClickEvent>, Receiver<StatusBarClickEvent>)> =
+    Lazy::new(crossbeam_channel::unbounded);
+
+/// Returns the icon-click event receiver (consumed by the event-forward thread).
+pub fn icon_click_receiver() -> &'static Receiver<StatusBarClickEvent> {
+    &ICON_CLICK_CHANNEL.1
+}
+
+/// Returns the menu-click event receiver (consumed by the event-forward thread).
+pub fn menu_click_receiver() -> &'static Receiver<StatusBarClickEvent> {
+    &MENU_CLICK_CHANNEL.1
+}
+
+/// Registers tray-icon's channel senders with plugin-statusbar so bridge events
+/// are forwarded into the local channels. Called from set_ohos_app at startup.
+pub fn register_statusbar_channels() {
+    openharmony_ability_plugin_statusbar::register_icon_click_sender(ICON_CLICK_CHANNEL.0.clone());
+    openharmony_ability_plugin_statusbar::register_menu_click_sender(MENU_CLICK_CHANNEL.0.clone());
+}
 
 pub fn register_tray_id(id: TrayIconId) {
     let mut guard = TRAY_ID.write().unwrap();
@@ -43,8 +74,8 @@ pub fn start_event_forward_thread() {
     }
 
     thread::spawn(move || {
-        let icon_receiver = openharmony_ability::statusbar::icon_click_receiver();
-        let menu_receiver = openharmony_ability::statusbar::menu_click_receiver();
+        let icon_receiver = icon_click_receiver();
+        let menu_receiver = menu_click_receiver();
 
         loop {
             select! {
@@ -57,7 +88,7 @@ pub fn start_event_forward_thread() {
                 recv(menu_receiver) -> event => {
                     if let Ok(status_bar_event) = event {
                         let raw_code = match &status_bar_event {
-                            openharmony_ability::statusbar::StatusBarClickEvent::MenuClick { menu_code } => menu_code.clone(),
+                            StatusBarClickEvent::MenuClick { menu_code } => menu_code.clone(),
                             _ => String::new(),
                         };
 
@@ -82,11 +113,11 @@ pub fn start_event_forward_thread() {
                             MenuAction::Check(code) => {
                                 log::debug!("[TrayIcon] menu click → check toggle: {}", code);
                                 toggle_check_item(&code);
-                                openharmony_ability::send_menu_event(code);
+                                muda::send_menu_event(code);
                             }
                             MenuAction::Regular => {
                                 log::debug!("[TrayIcon] menu click → regular: {}", menu_code);
-                                openharmony_ability::send_menu_event(menu_code);
+                                muda::send_menu_event(menu_code);
                             }
                         }
                     }
@@ -106,13 +137,23 @@ fn execute_predefined_action(predefined_type: &str) {
     log::debug!("[TrayIcon] execute_predefined_action: {}", predefined_type);
     match predefined_type {
         "quit" => {
-            let app = super::get_ohos_app();
-            app.exit(0);
+            // The quit action terminates the process. We use std::process::exit
+            // directly because the event-forward thread is a background worker
+            // without an N-API Env, and OpenHarmonyApp's modern bridge API
+            // routes termination through the app-control plugin (which requires
+            // a main-thread Env). The ArkTS ability's onDestroy will run cleanup.
+            std::process::exit(0);
         }
         "minimize" | "hide" | "maximize" | "close" | "fullscreen" | "about"
         | "copy" | "cut" | "paste" | "selectAll" | "undo" | "redo"
         | "recover" => {
-            openharmony_ability::statusbar::execute_predefined_action(predefined_type).ok();
+            let client = super::get_statusbar_client();
+            let request = openharmony_ability_plugin_statusbar::StatusBarPredefinedRequest {
+                action: predefined_type.to_string(),
+            };
+            futures_executor::block_on(client.execute_predefined(request))
+                .map_err(|e| log::warn!("[TrayIcon] predefined action error: {}", e))
+                .ok();
         }
         _ => {
             log::debug!("[TrayIcon] unsupported predefined action: {}", predefined_type);
@@ -180,16 +221,19 @@ fn rebuild_and_update_menu(json: &str) {
     MENU_METADATA.lock().unwrap().flat_ids = flat_ids;
 
     if !groups.is_empty() {
-        let app = super::get_ohos_app();
-        openharmony_ability::statusbar::update_status_bar_menu(app, &groups).ok();
+        let client = super::get_statusbar_client();
+        let request = openharmony_ability_plugin_statusbar::StatusBarUpdateMenuRequest::from(&groups);
+        futures_executor::block_on(client.update_menu(request))
+            .map_err(|e| log::warn!("[TrayIcon] update_menu error in rebuild: {}", e))
+            .ok();
     }
 }
 
 fn convert_icon_click(
-    event: openharmony_ability::statusbar::StatusBarClickEvent,
+    event: StatusBarClickEvent,
 ) -> TrayIconEvent {
     let button = match event {
-        openharmony_ability::statusbar::StatusBarClickEvent::IconClick { click_type } => {
+        StatusBarClickEvent::IconClick { click_type } => {
             match click_type.as_str() {
                 "rightClick" => MouseButton::Right,
                 unknown => {
@@ -237,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_icon_click_left() {
-        let event = openharmony_ability::statusbar::StatusBarClickEvent::IconClick {
+        let event = StatusBarClickEvent::IconClick {
             click_type: "leftClick".to_string(),
         };
         let tray_event = convert_icon_click(event);
@@ -252,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_icon_click_right() {
-        let event = openharmony_ability::statusbar::StatusBarClickEvent::IconClick {
+        let event = StatusBarClickEvent::IconClick {
             click_type: "rightClick".to_string(),
         };
         let tray_event = convert_icon_click(event);
@@ -264,4 +308,11 @@ mod tests {
             _ => panic!("unexpected event type"),
         }
     }
+}
+
+/// Sends an icon click event into tray-icon's internal channel.
+/// Used by test simulation commands to inject tray click events.
+#[cfg(target_env = "ohos")]
+pub fn send_icon_click(click_type: String) {
+    let _ = ICON_CLICK_CHANNEL.0.send(StatusBarClickEvent::IconClick { click_type });
 }

@@ -149,6 +149,10 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     platform_impl::set_ohos_app(app);
 }
 
+/// Sends an icon click event into tray-icon's internal channel (for test simulation).
+#[cfg(target_env = "ohos")]
+pub use platform_impl::send_icon_click;
+
 /// Re-export of [muda](::muda) crate and used for tray context menu.
 pub mod menu {
     pub use muda::*;

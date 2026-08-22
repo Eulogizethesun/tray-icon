@@ -25,3 +25,6 @@ mod platform;
 mod platform;
 
 pub(crate) use self::platform::*;
+
+#[cfg(target_env = "ohos")]
+pub use self::platform::send_icon_click;
