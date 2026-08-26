@@ -308,6 +308,34 @@ mod tests {
             _ => panic!("unexpected event type"),
         }
     }
+
+    #[test]
+    fn test_icon_click_unknown_type_defaults_left() {
+        let event = StatusBarClickEvent::IconClick {
+            click_type: "middleClick".to_string(),
+        };
+        let tray_event = convert_icon_click(event);
+        match tray_event {
+            TrayIconEvent::Click { button, .. } => {
+                assert_eq!(button, MouseButton::Left);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn test_menu_click_event_defaults_left() {
+        let event = StatusBarClickEvent::MenuClick {
+            menu_code: "item_0".to_string(),
+        };
+        let tray_event = convert_icon_click(event);
+        match tray_event {
+            TrayIconEvent::Click { button, .. } => {
+                assert_eq!(button, MouseButton::Left);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
 }
 
 /// Sends an icon click event into tray-icon's internal channel.

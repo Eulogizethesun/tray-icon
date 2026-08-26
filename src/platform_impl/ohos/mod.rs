@@ -1473,4 +1473,65 @@ mod tests {
         assert_eq!(groups[1].len(), 1);
         assert_eq!(groups[2].len(), 2);
     }
+
+    // ── serde-error branches for menu_to_status_bar_items / extract_menu_metadata ──
+
+    /// Minimal ContextMenu mock that returns a fixed JSON string.
+    struct MockContextMenu {
+        json: String,
+    }
+
+    impl crate::menu::ContextMenu for MockContextMenu {
+        fn ohos_context_menu(&self) -> String {
+            self.json.clone()
+        }
+    }
+
+    #[test]
+    fn menu_to_status_bar_items_invalid_json_returns_none() {
+        let menu: Option<Box<dyn crate::menu::ContextMenu>> =
+            Some(Box::new(MockContextMenu {
+                json: "{invalid json".to_string(),
+            }));
+        let result = menu_to_status_bar_items(&menu);
+        assert!(result.is_none(), "invalid JSON should yield None");
+    }
+
+    #[test]
+    fn menu_to_status_bar_items_empty_array_returns_none() {
+        let menu: Option<Box<dyn crate::menu::ContextMenu>> =
+            Some(Box::new(MockContextMenu {
+                json: "[]".to_string(),
+            }));
+        let result = menu_to_status_bar_items(&menu);
+        assert!(result.is_none(), "empty array should yield None");
+    }
+
+    #[test]
+    fn menu_to_status_bar_items_none_menu_returns_none() {
+        let menu: Option<Box<dyn crate::menu::ContextMenu>> = None;
+        let result = menu_to_status_bar_items(&menu);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_menu_metadata_invalid_json_returns_empty() {
+        let menu: Option<Box<dyn crate::menu::ContextMenu>> =
+            Some(Box::new(MockContextMenu {
+                json: "not json at all".to_string(),
+            }));
+        let (predefined, check_state, menu_json) = extract_menu_metadata(&menu);
+        assert!(predefined.is_empty());
+        assert!(check_state.is_empty());
+        assert!(menu_json.is_none());
+    }
+
+    #[test]
+    fn extract_menu_metadata_none_menu_returns_empty() {
+        let menu: Option<Box<dyn crate::menu::ContextMenu>> = None;
+        let (predefined, check_state, menu_json) = extract_menu_metadata(&menu);
+        assert!(predefined.is_empty());
+        assert!(check_state.is_empty());
+        assert!(menu_json.is_none());
+    }
 }
