@@ -46,12 +46,6 @@ pub fn icon_to_status_bar_icon(
     const MAX_STATUS_BAR_ICON_EDGE: u32 = 256;
 
     let size = width.min(height).min(MAX_STATUS_BAR_ICON_EDGE);
-    log::debug!(
-        "[TrayIcon] icon_to_status_bar_icon: src={}x{} -> status_bar_size={}",
-        width,
-        height,
-        size
-    );
     let scaled_rgba = if width != size || height != size {
         scale_rgba(rgba, width, height, size, size)
     } else {
@@ -325,5 +319,4 @@ mod tests {
         let white = result.white.borrow().clone().unwrap();
         assert_eq!(white.len(), 32 * 32 * 4);
     }
-
-    }
+}

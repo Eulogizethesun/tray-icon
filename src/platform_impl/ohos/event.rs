@@ -107,16 +107,13 @@ pub fn start_event_forward_thread() {
 
                         match action {
                             MenuAction::Predefined(predefined_type) => {
-                                log::debug!("[TrayIcon] menu click → predefined: {}", predefined_type);
                                 execute_predefined_action(&predefined_type);
                             }
                             MenuAction::Check(code) => {
-                                log::debug!("[TrayIcon] menu click → check toggle: {}", code);
                                 toggle_check_item(&code);
                                 muda::send_menu_event(code);
                             }
                             MenuAction::Regular => {
-                                log::debug!("[TrayIcon] menu click → regular: {}", menu_code);
                                 muda::send_menu_event(menu_code);
                             }
                         }
@@ -134,7 +131,6 @@ enum MenuAction {
 }
 
 fn execute_predefined_action(predefined_type: &str) {
-    log::debug!("[TrayIcon] execute_predefined_action: {}", predefined_type);
     match predefined_type {
         "quit" => {
             // The quit action terminates the process. We use std::process::exit
@@ -162,7 +158,6 @@ fn execute_predefined_action(predefined_type: &str) {
 }
 
 fn toggle_check_item(menu_code: &str) {
-    log::debug!("[TrayIcon] toggle_check_item: {}", menu_code);
     let json = {
         let mut metadata = MENU_METADATA.lock().unwrap();
         if let Some(checked) = metadata.check_state.get_mut(menu_code) {
@@ -267,9 +262,7 @@ fn translate_menu_code(raw_code: &str) -> String {
 
     match raw_code.parse::<usize>() {
         Ok(idx) if idx < metadata.flat_ids.len() => {
-            let translated = metadata.flat_ids[idx].clone();
-            log::debug!("[TrayIcon] translate: '{}' → '{}' (index {})", raw_code, translated, idx);
-            translated
+            metadata.flat_ids[idx].clone()
         }
         _ => raw_code.to_string(),
     }

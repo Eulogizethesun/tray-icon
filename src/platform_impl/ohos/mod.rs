@@ -81,11 +81,9 @@ fn bridge_worker_tx() -> &'static std::sync::mpsc::Sender<BridgeCommand> {
             std::thread::Builder::new()
                 .name("tray-bridge".to_string())
                 .spawn(move || {
-                    log::debug!("[TrayIcon] bridge worker started");
                     while let Ok(cmd) = rx.recv() {
                         cmd();
                     }
-                    log::debug!("[TrayIcon] bridge worker exiting");
                 })
                 .expect("Failed to spawn tray-bridge worker thread");
             tx
@@ -104,6 +102,10 @@ fn dispatch_bridge_call(f: impl FnOnce() + Send + 'static) {
 
 pub struct TrayIcon {
     attrs: RefCell<TrayIconAttributes>,
+    /// Best-effort mirror of the tray icon's visibility state. Updated locally
+    /// on `set_visible`/`new`/`drop`, but may go stale after external state
+    /// changes (e.g. system-driven removals) until the next status callback
+    /// refreshes it.
     is_visible: RefCell<bool>,
 }
 
@@ -130,9 +132,7 @@ impl TrayIcon {
         // Bridge call: ohos.statusbar/add — dispatched to the worker thread so the
         // main thread is never blocked waiting on a TSFN response (would deadlock).
         let request = StatusBarAddRequest::from(&item);
-        log::info!("[TrayIcon] new: before dispatch_bridge_call (add)");
         dispatch_bridge_call(move || {
-            log::info!("[TrayIcon] worker: add closure entered");
             let client = get_statusbar_client();
             // Best-effort removal of any stale status-bar registration left by a
             // prior/killed instance of this app. statusBarManager rejects a
@@ -143,18 +143,14 @@ impl TrayIcon {
             if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
                 log::warn!("[TrayIcon] pre-add remove (best-effort) error: {}", e);
             }
-            log::info!("[TrayIcon] worker: before block_on(client.add)");
             match futures_executor::block_on(client.add(request)) {
-                Ok(_) => log::info!("[TrayIcon] worker: add Ok"),
+                Ok(_) => {}
                 Err(e) => log::warn!("[TrayIcon] add error in new: {}", e),
             }
         });
-        log::info!("[TrayIcon] new: after dispatch_bridge_call (add), before register_tray_id");
 
         event::register_tray_id(id);
-        log::info!("[TrayIcon] new: after register_tray_id, before start_event_forward_thread");
         event::start_event_forward_thread();
-        log::info!("[TrayIcon] new: after start_event_forward_thread, returning Self");
 
         Ok(Self {
             attrs: RefCell::new(attrs),
@@ -367,12 +363,8 @@ fn menu_to_status_bar_items(
 ) -> Option<Vec<Vec<StatusBarMenuItem>>> {
     menu.as_ref().and_then(|m| {
         let json = m.ohos_context_menu();
-        log::info!("[TrayIcon] menu_to_status_bar_items: json_len={} json={}", json.len(), &json[..json.len().min(500)]);
         let items: Vec<MenuJsonItem> = match serde_json::from_str::<Vec<MenuJsonItem>>(&json) {
-            Ok(v) => {
-                log::info!("[TrayIcon] menu_to_status_bar_items: deserialized {} items", v.len());
-                v
-            }
+            Ok(v) => v,
             Err(e) => {
                 log::warn!("[TrayIcon] menu_to_status_bar_items: serde deserialized FAILED: {}", e);
                 Vec::new()
@@ -405,12 +397,8 @@ fn extract_menu_metadata(
         return (HashMap::new(), HashMap::new(), None);
     };
     let json = m.ohos_context_menu();
-    log::info!("[TrayIcon] extract_menu_metadata: json_len={} json={}", json.len(), &json[..json.len().min(500)]);
     let items: Vec<MenuJsonItem> = match serde_json::from_str::<Vec<MenuJsonItem>>(&json) {
-        Ok(v) => {
-            log::info!("[TrayIcon] extract_menu_metadata: deserialized {} items", v.len());
-            v
-        }
+        Ok(v) => v,
         Err(e) => {
             log::warn!("[TrayIcon] extract_menu_metadata: serde deserialized FAILED: {}", e);
             Vec::new()
@@ -467,17 +455,14 @@ fn collect_metadata_from_items(
     check_state: &mut HashMap<String, bool>,
 ) {
     for item in items {
-        log::debug!("[TrayIcon] collect_metadata: id={}, type={}, predefined_type={:?}", item.id, item.item_type, item.predefined_type);
         if item.item_type == "predefined" {
             if let Some(ref pt) = item.predefined_type {
                 if pt != "separator" {
                     predefined_map.insert(item.id.clone(), pt.clone());
-                    log::debug!("[TrayIcon]   → predefined_map: {} → {}", item.id, pt);
                 }
             }
         } else if item.item_type == "check" {
             check_state.insert(item.id.clone(), item.checked.unwrap_or(false));
-            log::debug!("[TrayIcon]   → check_state: {} → {}", item.id, item.checked.unwrap_or(false));
         }
         if let Some(ref children) = item.submenu_items {
             collect_metadata_from_items(children, predefined_map, check_state);
@@ -539,7 +524,6 @@ pub(crate) fn remap_menu_codes_to_indices(
             }
         }
     }
-    log::debug!("[TrayIcon] remap_menu_codes: {} items → {:?}", idx, flat_ids);
     flat_ids
 }
 
@@ -679,7 +663,6 @@ fn build_item_options(
     checked: Option<bool>,
     icon_b64: Option<&str>,
 ) -> Option<StatusBarMenuItemOptions> {
-    log::debug!("[TrayIcon] build_item_options: type={}, checked={:?}, has_icon={}", item_type, checked, icon_b64.is_some());
     let selected = if item_type == "check" { checked } else { None };
 
     let (icon_rgba, icon_width, icon_height) = if item_type == "icon" {
@@ -704,23 +687,18 @@ fn build_item_options(
 
 fn decode_icon_from_base64(icon_b64: Option<&str>) -> (Option<Vec<u8>>, Option<u32>, Option<u32>) {
     let Some(b64) = icon_b64 else {
-        log::debug!("[TrayIcon] decode_icon_from_base64: no base64 data");
         return (None, None, None);
     };
-    log::debug!("[TrayIcon] decode_icon_from_base64: b64 len={}", b64.len());
     use base64::Engine;
     let Ok(png_bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-        log::debug!("[TrayIcon] decode_icon_from_base64: base64 decode failed");
         return (None, None, None);
     };
-    log::debug!("[TrayIcon] decode_icon_from_base64: png_bytes len={}", png_bytes.len());
     match decode_png_to_rgba(&png_bytes) {
         Ok((rgba, width, height)) => {
-            log::debug!("[TrayIcon] decode_icon_from_base64: decoded {}x{}, rgba len={}", width, height, rgba.len());
             (Some(rgba), Some(width), Some(height))
         }
         Err(e) => {
-            log::debug!("[TrayIcon] decode_icon_from_base64: PNG decode failed: {}", e);
+            log::warn!("[TrayIcon] decode_icon_from_base64: PNG decode failed: {}", e);
             (None, None, None)
         }
     }
@@ -729,7 +707,6 @@ fn decode_icon_from_base64(icon_b64: Option<&str>) -> (Option<Vec<u8>>, Option<u
 fn build_item_from_attrs(
     attrs: &TrayIconAttributes,
 ) -> crate::Result<StatusBarItem> {
-    log::info!("[TrayIcon] build_item_from_attrs: enter");
     let icon = attrs.icon.as_ref().ok_or_else(|| {
         crate::Error::OsError(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -737,9 +714,7 @@ fn build_item_from_attrs(
         ))
     })?;
 
-    log::info!("[TrayIcon] build_item_from_attrs: before icon_to_status_bar_icon");
     let status_bar_icon = icon::icon_to_status_bar_icon(&icon.inner, attrs.icon_is_template)?;
-    log::info!("[TrayIcon] build_item_from_attrs: after icon_to_status_bar_icon");
 
     let quick_operation = if let Some(ref config) = attrs.quick_operation {
         QuickOperation {
@@ -767,10 +742,6 @@ fn build_item_from_attrs(
     };
 
     let menus = menu_to_status_bar_items(&attrs.menu);
-    log::info!(
-        "[TrayIcon] build_item_from_attrs: after menu_to_status_bar_items (has_groups={}), returning",
-        menus.is_some()
-    );
 
     Ok(StatusBarItem {
         icons: status_bar_icon,
