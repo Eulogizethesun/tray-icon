@@ -131,18 +131,21 @@ enum MenuAction {
 }
 
 fn execute_predefined_action(predefined_type: &str) {
+    // All predefined actions — including quit — dispatch through the
+    // ohos.statusbar execute-predefined bridge. quit resolves on the ArkTS
+    // side: PredefinedActionExecutor case 'quit' → context.terminateSelf(),
+    // the graceful OHOS ability termination. (An earlier workaround called
+    // std::process::exit(0) directly from this thread; appspawn intercepts
+    // direct exit() calls — faultlog "Unexpected call: exit(0)" — and
+    // converts them to SIGABRT, leaving a cppcrash record on every Quit.
+    // That workaround predates the StatusbarPlugin execute-predefined
+    // handler and is obsolete: minimize/hide/showAll etc. prove the bridge
+    // call works from this background thread.)
     match predefined_type {
-        "quit" => {
-            // The quit action terminates the process. We use std::process::exit
-            // directly because the event-forward thread is a background worker
-            // without an N-API Env, and OpenHarmonyApp's modern bridge API
-            // routes termination through the app-control plugin (which requires
-            // a main-thread Env). The ArkTS ability's onDestroy will run cleanup.
-            std::process::exit(0);
-        }
         "minimize" | "hide" | "maximize" | "close" | "fullscreen" | "about"
+        | "quit"
         | "copy" | "cut" | "paste" | "selectAll" | "undo" | "redo"
-        | "recover" => {
+        | "recover" | "showAll" | "bringAllToFront" => {
             let client = super::get_statusbar_client();
             let request = openharmony_ability_plugin_statusbar::StatusBarPredefinedRequest {
                 action: predefined_type.to_string(),
