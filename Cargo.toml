@@ -105,7 +105,10 @@ serde_json = "1"
 muda = { git = "https://github.com/Eulogizethesun/muda", branch = "ohdev-git" }
 
 [target."cfg(target_env = \"ohos\")".dependencies]
-openharmony-ability = { git = "https://github.com/Eulogizethesun/openharmony-ability", branch = "ohdev-git", features = ["menu", "statusbar"] }
+openharmony-ability = { git = "https://github.com/Eulogizethesun/openharmony-ability", branch = "ohdev-git" }
+openharmony-ability-plugin-statusbar = { git = "https://github.com/Eulogizethesun/openharmony-ability", branch = "ohdev-git" }
+openharmony-ability-plugin-menu = { git = "https://github.com/Eulogizethesun/openharmony-ability", branch = "ohdev-git" }
+futures-executor = "0.3"
 png = "0.18"
 base64 = "0.22"
 log = "0.4"
