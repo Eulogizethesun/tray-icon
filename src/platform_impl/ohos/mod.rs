@@ -45,6 +45,18 @@ pub(crate) struct MenuMetadata {
 }
 
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
+    // First registration stays authoritative (NG4 one-app-per-process,
+    // design D14 S42): a second call means someone re-ran tray init for
+    // another UIAbility instance. Return early so the duplicate cannot
+    // panic on the client OnceLocks below or allocate extra SCB
+    // clientProxyMap slots (the map caps at 50 entries; exhausting it
+    // disables tray interaction).
+    if OHOS_APP.get().is_some() {
+        log::warn!(
+            "[TrayIcon] duplicate set_ohos_app ignored (first registration stays authoritative)"
+        );
+        return;
+    }
     // Register the Rust-side bridge plugins BEFORE creating the clients that
     // dispatch calls through them. `register_plugin` populates the native
     // module's bridge-plugin declarations, which the ArkTS BridgeHost matches
