@@ -239,6 +239,11 @@ pub struct TrayIconAttributes {
     pub icon: Option<Icon>,
 
     /// Tray icon temp dir path. **Linux only**.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS:** no-op — icons are transferred through the bridge, not
+    ///   written to disk.
     pub temp_dir_path: Option<PathBuf>,
 
     /// Use the icon as a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc). **macOS only**.
@@ -371,6 +376,11 @@ impl TrayIconBuilder {
     ///
     /// On Linux, we need to write the icon to the disk and usually it will
     /// be `$XDG_RUNTIME_DIR/tray-icon` or `$TEMP/tray-icon`.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS:** no-op — icons are transferred through the bridge, not
+    ///   written to disk.
     pub fn with_temp_dir_path<P: AsRef<Path>>(mut self, s: P) -> Self {
         self.attrs.temp_dir_path = Some(s.as_ref().to_path_buf());
         self
