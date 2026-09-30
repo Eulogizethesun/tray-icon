@@ -47,10 +47,14 @@ pub(crate) struct MenuMetadata {
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     // First registration stays authoritative (NG4 one-app-per-process,
     // design D14 S42): a second call means someone re-ran tray init for
-    // another UIAbility instance. Return early so the duplicate cannot
-    // panic on the client OnceLocks below or allocate extra SCB
-    // clientProxyMap slots (the map caps at 50 entries; exhausting it
-    // disables tray interaction).
+    // another UIAbility instance — return early so the duplicate does not
+    // redo the wiring below (plugin registration, client construction, muda
+    // injection, event-channel registration). Note this does NOT save SCB
+    // clientProxyMap slots: nothing in the skipped path performs a bridge
+    // round trip (the client constructors are pure local handle-taking,
+    // `app.bridge()`), and the system-side clientProxyMap is populated per
+    // pid at ArkTS addToStatusBar — exhausted by zombie pids from killed
+    // processes, not by repeated Rust-side init.
     if OHOS_APP.get().is_some() {
         log::warn!(
             "[TrayIcon] duplicate set_ohos_app ignored (first registration stays authoritative)"
@@ -73,16 +77,23 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
         .expect("Failed to create StatusBarClient");
     let menu_client = openharmony_ability_plugin_menu::MenuClient::new(&app)
         .expect("Failed to create MenuClient");
-    // Under the NG4 one-app-per-process invariant this OnceLock is set exactly
-    // once. A second set would mean someone re-ran tray init for another
-    // UIAbility instance — downgrade the panic to a warn (design D14 S42,
-    // openspec multi-uiability-windows) so a stray re-init cannot take down
-    // the whole process; the first registration stays authoritative.
+    // The `.get()` guard above is not atomic with this `.set()`: two
+    // concurrent first-calls can both pass it, and the loser's set fails
+    // here. Downgrade to warn + early return (design D14 S42, openspec
+    // multi-uiability-windows) so a stray concurrent re-init cannot take
+    // down the whole process — the first registration stays authoritative,
+    // and the loser must not re-run the wiring below (muda client
+    // injection, event-channel registration).
     if OHOS_APP.set(app).is_err() {
         log::warn!("[TrayIcon] OHOS_APP already set — ignoring duplicate set_ohos_app (first registration stays authoritative)");
+        return;
     }
+    // Unreachable in practice — OHOS_APP is set first, so a failure here
+    // implies the OHOS_APP.set above already failed and returned; kept
+    // defensive (never panic during init, same S42 hardening).
     if STATUSBAR_CLIENT.set(statusbar_client).is_err() {
-        panic!("STATUSBAR_CLIENT already set");
+        log::warn!("[TrayIcon] STATUSBAR_CLIENT already set — keeping the first client");
+        return;
     }
     // Inject muda's MenuClient (muda does not hold OpenHarmonyApp itself)
     muda::set_menu_client(menu_client);
