@@ -407,7 +407,7 @@ impl TrayIcon {
     pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {
         // OHOS tray icons are transferred through the bridge (base64) rather
         // than written to disk, so there is no temp dir to configure.
-        log::warn!("[tray-icon] set_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)");
+        log::warn!("[TrayIcon] set_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)");
     }
 
     pub fn set_icon_as_template(&mut self, is_template: bool) -> crate::Result<()> {
