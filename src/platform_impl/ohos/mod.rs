@@ -61,6 +61,21 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
         );
         return;
     }
+    // Claim the app slot BEFORE any wiring: `OnceLock::set` is the atomic
+    // check-and-claim, so the loser of a concurrent first-call exits here —
+    // before plugin registration (whose "already registered" Err would log a
+    // misleading error for what is actually a benign duplicate) and before
+    // client construction. The `.get()` guard above stays as the fast path
+    // with the clearer message for the common sequential-duplicate case.
+    // A lost race is warn + early return (design D14 S42, openspec
+    // multi-uiability-windows) so a stray concurrent re-init cannot take
+    // down the whole process — the first registration stays authoritative,
+    // and the loser must not re-run the wiring below (plugin registration,
+    // client construction, muda injection, event-channel registration).
+    if OHOS_APP.set(app.clone()).is_err() {
+        log::warn!("[TrayIcon] OHOS_APP already set — ignoring duplicate set_ohos_app (first registration stays authoritative)");
+        return;
+    }
     // Register the Rust-side bridge plugins BEFORE creating the clients that
     // dispatch calls through them. `register_plugin` populates the native
     // module's bridge-plugin declarations, which the ArkTS BridgeHost matches
@@ -77,19 +92,8 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
         .expect("Failed to create StatusBarClient");
     let menu_client = openharmony_ability_plugin_menu::MenuClient::new(&app)
         .expect("Failed to create MenuClient");
-    // The `.get()` guard above is not atomic with this `.set()`: two
-    // concurrent first-calls can both pass it, and the loser's set fails
-    // here. Downgrade to warn + early return (design D14 S42, openspec
-    // multi-uiability-windows) so a stray concurrent re-init cannot take
-    // down the whole process — the first registration stays authoritative,
-    // and the loser must not re-run the wiring below (muda client
-    // injection, event-channel registration).
-    if OHOS_APP.set(app).is_err() {
-        log::warn!("[TrayIcon] OHOS_APP already set — ignoring duplicate set_ohos_app (first registration stays authoritative)");
-        return;
-    }
-    // Unreachable in practice — OHOS_APP is set first, so a failure here
-    // implies the OHOS_APP.set above already failed and returned; kept
+    // Unreachable in practice — OHOS_APP was claimed at the top of this
+    // function, so any competing caller already returned there; kept
     // defensive (same S42 hardening). Only this `.set()` path is
     // panic-free: the two `.expect`s above still panic when no bridge
     // session is active (uninitialized / misuse scenarios).
