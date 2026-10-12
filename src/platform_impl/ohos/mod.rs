@@ -263,7 +263,13 @@ impl TrayIcon {
             let status_bar_icon = icon::icon_to_status_bar_icon(&i.inner, is_template)?;
             openharmony_ability_plugin_statusbar::StatusBarUpdateIconRequest::from(status_bar_icon)
         } else {
-            // Clear icon by sending empty icon data
+            // Clear icon by sending empty icon data. OHOS semantics diverge from
+            // the upstream doc line ("it will remove the icon"): the statusbar
+            // entry itself is kept with cleared pixels. Note the side effect —
+            // attrs.icon becomes None, so any later remove+re-add style update
+            // (set_title/set_quick_operation/set_icon_as_template) can no longer
+            // rebuild the item; those skip with a warn instead of removing the
+            // entry (see set_title).
             let empty_icon = StatusBarIcon::default();
             openharmony_ability_plugin_statusbar::StatusBarUpdateIconRequest::from(empty_icon)
         };
@@ -351,8 +357,20 @@ impl TrayIcon {
         if *self.is_visible.borrow() {
             // Pre-compute the add request on the calling thread (borrows self.attrs),
             // then dispatch remove+add together in one closure so they stay ordered.
-            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
-            let add_request = item.as_ref().map(|i| StatusBarAddRequest::from(i));
+            // Build failure (typically: attrs has no icon after set_icon(None)) must
+            // NOT fall through to a remove without a re-add — that silently deletes
+            // the tray entry while is_visible/TRAY_VISIBLE still claim armed, and the
+            // single statusbar slot then rejects every later TrayIcon::new. Skip the
+            // dispatch instead and keep the current entry; the attrs update above
+            // survives, so the next successful rebuild (e.g. set_icon with an icon)
+            // picks it up.
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_title skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return;
+            };
+            let add_request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
                 with_statusbar_client("set_title", |client| {
                     if let Err(e) =
@@ -360,10 +378,8 @@ impl TrayIcon {
                     {
                         record_bridge_error("set_title remove", &e);
                     }
-                    if let Some(request) = add_request {
-                        if let Err(e) = futures_executor::block_on(client.add(request)) {
-                            record_bridge_error("set_title add", &e);
-                        }
+                    if let Err(e) = futures_executor::block_on(client.add(add_request)) {
+                        record_bridge_error("set_title add", &e);
                     }
                 });
             });
@@ -402,8 +418,15 @@ impl TrayIcon {
     pub fn set_quick_operation(&mut self, config: Option<crate::QuickOperationConfig>) {
         self.attrs.borrow_mut().quick_operation = config;
         if *self.is_visible.borrow() {
-            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
-            let add_request = item.as_ref().map(|i| StatusBarAddRequest::from(i));
+            // Same guard as set_title: a remove without a re-add would silently
+            // delete the tray entry (build fails when attrs has no icon).
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_quick_operation skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return;
+            };
+            let add_request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
                 with_statusbar_client("set_quick_operation", |client| {
                     if let Err(e) =
@@ -411,10 +434,8 @@ impl TrayIcon {
                     {
                         record_bridge_error("set_quick_operation remove", &e);
                     }
-                    if let Some(request) = add_request {
-                        if let Err(e) = futures_executor::block_on(client.add(request)) {
-                            record_bridge_error("set_quick_operation add", &e);
-                        }
+                    if let Err(e) = futures_executor::block_on(client.add(add_request)) {
+                        record_bridge_error("set_quick_operation add", &e);
                     }
                 });
             });
