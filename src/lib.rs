@@ -380,7 +380,8 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **OHOS:** no-op — icons are transferred through the bridge, not
-    ///   written to disk.
+    ///   written to disk. The value is accepted silently; unlike
+    ///   [`TrayIcon::set_temp_dir_path`], no warning is logged.
     pub fn with_temp_dir_path<P: AsRef<Path>>(mut self, s: P) -> Self {
         self.attrs.temp_dir_path = Some(s.as_ref().to_path_buf());
         self
@@ -403,8 +404,10 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported. Left-click behavior is configured per-icon via
-    ///   [`TrayIcon::set_quick_operation`] instead.
+    /// - **OHOS:** Unsupported. The value is accepted but has no effect, and
+    ///   no warning is logged (unlike
+    ///   [`TrayIcon::set_show_menu_on_left_click`]). Left-click behavior is
+    ///   configured per-icon via [`TrayIcon::set_quick_operation`] instead.
     pub fn with_menu_on_left_click(mut self, enable: bool) -> Self {
         self.attrs.menu_on_left_click = enable;
         self
@@ -415,8 +418,10 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported. Menu presentation for status bar icons is
-    ///   system-controlled.
+    /// - **OHOS:** Unsupported. The value is accepted but has no effect, and
+    ///   no warning is logged (unlike
+    ///   [`TrayIcon::set_show_menu_on_right_click`]). Menu presentation for
+    ///   status bar icons is system-controlled.
     pub fn with_menu_on_right_click(mut self, enable: bool) -> Self {
         self.attrs.menu_on_right_click = enable;
         self

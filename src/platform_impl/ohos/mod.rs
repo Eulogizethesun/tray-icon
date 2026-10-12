@@ -90,7 +90,9 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     }
     // Unreachable in practice — OHOS_APP is set first, so a failure here
     // implies the OHOS_APP.set above already failed and returned; kept
-    // defensive (never panic during init, same S42 hardening).
+    // defensive (same S42 hardening). Only this `.set()` path is
+    // panic-free: the two `.expect`s above still panic when no bridge
+    // session is active (uninitialized / misuse scenarios).
     if STATUSBAR_CLIENT.set(statusbar_client).is_err() {
         log::warn!("[TrayIcon] STATUSBAR_CLIENT already set — keeping the first client");
         return;
