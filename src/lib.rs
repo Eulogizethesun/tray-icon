@@ -257,21 +257,30 @@ pub struct TrayIconAttributes {
 
     /// Whether to show the tray menu on left click or not, default is `true`.
     ///
+    /// `None` (the default) means "not specified" — the platform default
+    /// (`true`) applies; `Some(_)` records an explicit request, which lets
+    /// unsupported platforms warn at build time instead of silently
+    /// accepting the value.
+    ///
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported. Left-click behavior is configured per-icon via
+    /// - **OHOS:** Unsupported — a warning is logged at build time when set.
+    ///   Left-click behavior is configured per-icon via
     ///   [`TrayIcon::set_quick_operation`] instead.
-    pub menu_on_left_click: bool,
+    pub menu_on_left_click: Option<bool>,
 
     /// Whether to show the tray menu on right click or not, default is `true`.
     ///
+    /// `None` (the default) means "not specified" — see
+    /// [`TrayIconAttributes::menu_on_left_click`].
+    ///
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported. Menu presentation for status bar icons is
-    ///   system-controlled.
-    pub menu_on_right_click: bool,
+    /// - **OHOS:** Unsupported — a warning is logged at build time when set.
+    ///   Menu presentation for status bar icons is system-controlled.
+    pub menu_on_right_click: Option<bool>,
 
     /// Tray icon title.
     ///
@@ -300,8 +309,8 @@ impl Default for TrayIconAttributes {
             icon: None,
             temp_dir_path: None,
             icon_is_template: false,
-            menu_on_left_click: true,
-            menu_on_right_click: true,
+            menu_on_left_click: None,
+            menu_on_right_click: None,
             title: None,
             quick_operation: None,
         }
@@ -386,8 +395,9 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **OHOS:** no-op — icons are transferred through the bridge, not
-    ///   written to disk. The value is accepted silently; unlike
-    ///   [`TrayIcon::set_temp_dir_path`], no warning is logged.
+    ///   written to disk. A warning is logged at build time when set
+    ///   (tray#13 review follow-up F4), unlike
+    ///   [`TrayIcon::set_temp_dir_path`] which warns per call.
     pub fn with_temp_dir_path<P: AsRef<Path>>(mut self, s: P) -> Self {
         self.attrs.temp_dir_path = Some(s.as_ref().to_path_buf());
         self
@@ -410,12 +420,12 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported. The value is accepted but has no effect, and
-    ///   no warning is logged (unlike
-    ///   [`TrayIcon::set_show_menu_on_left_click`]). Left-click behavior is
+    /// - **OHOS:** Unsupported — a warning is logged at build time
+    ///   (tray#13 review follow-up F4), matching
+    ///   [`TrayIcon::set_show_menu_on_left_click`]. Left-click behavior is
     ///   configured per-icon via [`TrayIcon::set_quick_operation`] instead.
     pub fn with_menu_on_left_click(mut self, enable: bool) -> Self {
-        self.attrs.menu_on_left_click = enable;
+        self.attrs.menu_on_left_click = Some(enable);
         self
     }
 
@@ -424,12 +434,12 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported. The value is accepted but has no effect, and
-    ///   no warning is logged (unlike
-    ///   [`TrayIcon::set_show_menu_on_right_click`]). Menu presentation for
+    /// - **OHOS:** Unsupported — a warning is logged at build time
+    ///   (tray#13 review follow-up F4), matching
+    ///   [`TrayIcon::set_show_menu_on_right_click`]. Menu presentation for
     ///   status bar icons is system-controlled.
     pub fn with_menu_on_right_click(mut self, enable: bool) -> Self {
-        self.attrs.menu_on_right_click = enable;
+        self.attrs.menu_on_right_click = Some(enable);
         self
     }
 

@@ -201,6 +201,29 @@ impl TrayIcon {
             ));
         }
 
+        // Unsupported builder options fail loudly at build time (tray#13
+        // review follow-up F4): the attrs use Option semantics so an
+        // explicit `with_*` call is distinguishable from the default, and
+        // each explicit-but-unsupported option warns exactly once here —
+        // matching the per-call warnings of the runtime setters. tauri's
+        // config-driven path does not forward these on OHOS, so a warning
+        // here always means a direct builder call asked for them.
+        if attrs.temp_dir_path.is_some() {
+            log::warn!(
+                "[TrayIcon] with_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)"
+            );
+        }
+        if attrs.menu_on_left_click.is_some() {
+            log::warn!(
+                "[TrayIcon] with_menu_on_left_click has no effect on OpenHarmony; use set_quick_operation to configure the left-click popup"
+            );
+        }
+        if attrs.menu_on_right_click.is_some() {
+            log::warn!(
+                "[TrayIcon] with_menu_on_right_click has no effect on OpenHarmony (menu presentation for status bar icons is system-controlled)"
+            );
+        }
+
         // Make muda's CHECK_ITEMS the single check-state source for this menu:
         // status-bar check clicks flip the user's CheckMenuItem flags through
         // it (muda::toggle_check_item); no local mirror is kept.
