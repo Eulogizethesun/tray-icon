@@ -144,6 +144,12 @@ pub use self::tray_icon_id::TrayIconId;
 ///
 /// This must be called before creating any tray icons on OpenHarmony.
 /// Tauri calls this automatically during app initialization.
+///
+/// First registration wins: the app slot is claimed once per process (an atomic
+/// check-and-claim ahead of plugin registration), and a later call with a
+/// different app is rejected with a warning — the first registration stays
+/// authoritative for the process lifetime. Passing the same shared
+/// `OpenHarmonyApp` again is the normal re-entry and is a harmless fast path.
 #[cfg(target_env = "ohos")]
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     platform_impl::set_ohos_app(app);
@@ -505,6 +511,12 @@ impl TrayIcon {
     }
 
     /// Set new tray icon. If `None` is provided, it will remove the icon.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS**: `None` clears the icon pixels but keeps the status-bar entry in
+    ///   place (the entry is not removed) — diverging from the line above on
+    ///   purpose; see the implementation notes in `platform_impl::ohos`.
     pub fn set_icon(&self, icon: Option<Icon>) -> Result<()> {
         self.tray.borrow_mut().set_icon(icon)
     }
