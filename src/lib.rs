@@ -144,6 +144,13 @@ pub use self::tray_icon_id::TrayIconId;
 ///
 /// This must be called before creating any tray icons on OpenHarmony.
 /// Tauri calls this automatically during app initialization.
+///
+/// First registration wins: the app slot is claimed once per process (an
+/// atomic check-and-claim ahead of plugin registration), and any later call —
+/// whether it passes the same `OpenHarmonyApp` again or a different one — is
+/// ignored with a warning; the first registration stays authoritative for the
+/// process lifetime. The duplicate guard does not compare app identity, so a
+/// same-app re-entry warns the same way a different-app call does.
 #[cfg(target_env = "ohos")]
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     platform_impl::set_ohos_app(app);
@@ -239,6 +246,11 @@ pub struct TrayIconAttributes {
     pub icon: Option<Icon>,
 
     /// Tray icon temp dir path. **Linux only**.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS:** no-op — icons are transferred through the bridge, not
+    ///   written to disk.
     pub temp_dir_path: Option<PathBuf>,
 
     /// Use the icon as a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc). **macOS only**.
@@ -246,17 +258,30 @@ pub struct TrayIconAttributes {
 
     /// Whether to show the tray menu on left click or not, default is `true`.
     ///
+    /// `None` (the default) means "not specified" — the platform default
+    /// (`true`) applies; `Some(_)` records an explicit request, which lets
+    /// unsupported platforms warn at build time instead of silently
+    /// accepting the value.
+    ///
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    pub menu_on_left_click: bool,
+    /// - **OHOS:** Unsupported — a warning is logged at build time when set.
+    ///   Left-click behavior is configured per-icon via
+    ///   [`TrayIcon::set_quick_operation`] instead.
+    pub menu_on_left_click: Option<bool>,
 
     /// Whether to show the tray menu on right click or not, default is `true`.
     ///
+    /// `None` (the default) means "not specified" — see
+    /// [`TrayIconAttributes::menu_on_left_click`].
+    ///
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    pub menu_on_right_click: bool,
+    /// - **OHOS:** Unsupported — a warning is logged at build time when set.
+    ///   Menu presentation for status bar icons is system-controlled.
+    pub menu_on_right_click: Option<bool>,
 
     /// Tray icon title.
     ///
@@ -285,8 +310,8 @@ impl Default for TrayIconAttributes {
             icon: None,
             temp_dir_path: None,
             icon_is_template: false,
-            menu_on_left_click: true,
-            menu_on_right_click: true,
+            menu_on_left_click: None,
+            menu_on_right_click: None,
             title: None,
             quick_operation: None,
         }
@@ -367,6 +392,12 @@ impl TrayIconBuilder {
     ///
     /// On Linux, we need to write the icon to the disk and usually it will
     /// be `$XDG_RUNTIME_DIR/tray-icon` or `$TEMP/tray-icon`.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS:** no-op — icons are transferred through the bridge, not
+    ///   written to disk. A warning is logged at build time when set,
+    ///   unlike [`TrayIcon::set_temp_dir_path`] which warns per call.
     pub fn with_temp_dir_path<P: AsRef<Path>>(mut self, s: P) -> Self {
         self.attrs.temp_dir_path = Some(s.as_ref().to_path_buf());
         self
@@ -389,8 +420,12 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
+    /// - **OHOS:** Unsupported — a warning is logged at build time,
+    ///   matching [`TrayIcon::set_show_menu_on_left_click`]. Left-click
+    ///   behavior is configured per-icon via [`TrayIcon::set_quick_operation`]
+    ///   instead.
     pub fn with_menu_on_left_click(mut self, enable: bool) -> Self {
-        self.attrs.menu_on_left_click = enable;
+        self.attrs.menu_on_left_click = Some(enable);
         self
     }
 
@@ -399,8 +434,11 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
+    /// - **OHOS:** Unsupported — a warning is logged at build time,
+    ///   matching [`TrayIcon::set_show_menu_on_right_click`]. Menu
+    ///   presentation for status bar icons is system-controlled.
     pub fn with_menu_on_right_click(mut self, enable: bool) -> Self {
-        self.attrs.menu_on_right_click = enable;
+        self.attrs.menu_on_right_click = Some(enable);
         self
     }
 
@@ -482,6 +520,12 @@ impl TrayIcon {
     }
 
     /// Set new tray icon. If `None` is provided, it will remove the icon.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS**: `None` clears the icon pixels but keeps the status-bar entry in
+    ///   place (the entry is not removed) — diverging from the line above on
+    ///   purpose; see the implementation notes in `platform_impl::ohos`.
     pub fn set_icon(&self, icon: Option<Icon>) -> Result<()> {
         self.tray.borrow_mut().set_icon(icon)
     }
@@ -527,6 +571,10 @@ impl TrayIcon {
     ///
     /// On Linux, we need to write the icon to the disk and usually it will
     /// be `$XDG_RUNTIME_DIR/tray-icon` or `$TEMP/tray-icon`.
+    ///
+    /// ## Platform-specific:
+    ///
+    /// - **OHOS:** no-op — icons are transferred through the bridge, not written to disk.
     pub fn set_temp_dir_path<P: AsRef<Path>>(&self, path: Option<P>) {
         #[cfg(any(
             target_os = "linux",
@@ -581,10 +629,19 @@ impl TrayIcon {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
+    /// - **OHOS:** Unsupported. Left-click behavior is configured per-icon via
+    ///   [`TrayIcon::set_quick_operation`] instead.
     pub fn set_show_menu_on_left_click(&self, enable: bool) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.tray.borrow_mut().set_show_menu_on_left_click(enable);
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(target_env = "ohos")]
+        {
+            let _ = enable;
+            log::warn!(
+                "[TrayIcon] set_show_menu_on_left_click is not supported on OpenHarmony; use set_quick_operation to configure the left-click popup"
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_env = "ohos")))]
         let _ = enable;
     }
 
@@ -593,10 +650,19 @@ impl TrayIcon {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
+    /// - **OHOS:** Unsupported. Menu presentation for status bar icons is
+    ///   system-controlled.
     pub fn set_show_menu_on_right_click(&self, enable: bool) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.tray.borrow_mut().set_show_menu_on_right_click(enable);
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(target_env = "ohos")]
+        {
+            let _ = enable;
+            log::warn!(
+                "[TrayIcon] set_show_menu_on_right_click is not supported on OpenHarmony"
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_env = "ohos")))]
         let _ = enable;
     }
 
@@ -612,6 +678,10 @@ impl TrayIcon {
     pub fn show_menu(&self) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.tray.borrow().show_menu();
+        #[cfg(target_env = "ohos")]
+        log::warn!(
+            "[TrayIcon] show_menu is not supported on OpenHarmony: statusBarManager has no API to programmatically trigger the menu"
+        );
     }
 
     /// Set QuickOperation for left-click popup. **OHOS only**.
@@ -632,6 +702,7 @@ impl TrayIcon {
     /// ## Platform-specific:
     ///
     /// - **Linux**: Unsupported.
+    /// - **OHOS**: Unsupported — always returns `None`.
     pub fn rect(&self) -> Option<Rect> {
         self.tray.borrow().rect()
     }

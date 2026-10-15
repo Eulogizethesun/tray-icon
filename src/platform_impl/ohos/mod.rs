@@ -45,6 +45,37 @@ pub(crate) struct MenuMetadata {
 }
 
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
+    // First registration stays authoritative (NG4 one-app-per-process,
+    // design D14 S42): a second call means someone re-ran tray init for
+    // another UIAbility instance — return early so the duplicate does not
+    // redo the wiring below (plugin registration, client construction, muda
+    // injection, event-channel registration). Note this does NOT save SCB
+    // clientProxyMap slots: nothing in the skipped path performs a bridge
+    // round trip (the client constructors are pure local handle-taking,
+    // `app.bridge()`), and the system-side clientProxyMap is populated per
+    // pid at ArkTS addToStatusBar — exhausted by zombie pids from killed
+    // processes, not by repeated Rust-side init.
+    if OHOS_APP.get().is_some() {
+        log::warn!(
+            "[TrayIcon] duplicate set_ohos_app ignored (first registration stays authoritative)"
+        );
+        return;
+    }
+    // Claim the app slot BEFORE any wiring: `OnceLock::set` is the atomic
+    // check-and-claim, so the loser of a concurrent first-call exits here —
+    // before plugin registration (whose "already registered" Err would log a
+    // misleading error for what is actually a benign duplicate) and before
+    // client construction. The `.get()` guard above stays as the fast path
+    // with the clearer message for the common sequential-duplicate case.
+    // A lost race is warn + early return (design D14 S42, openspec
+    // multi-uiability-windows) so a stray concurrent re-init cannot take
+    // down the whole process — the first registration stays authoritative,
+    // and the loser must not re-run the wiring below (plugin registration,
+    // client construction, muda injection, event-channel registration).
+    if OHOS_APP.set(app.clone()).is_err() {
+        log::warn!("[TrayIcon] OHOS_APP already set — ignoring duplicate set_ohos_app (first registration stays authoritative)");
+        return;
+    }
     // Register the Rust-side bridge plugins BEFORE creating the clients that
     // dispatch calls through them. `register_plugin` populates the native
     // module's bridge-plugin declarations, which the ArkTS BridgeHost matches
@@ -57,13 +88,27 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     if let Err(e) = app.register_plugin(openharmony_ability_plugin_menu::MenuBridgePlugin) {
         log::error!("[TrayIcon] failed to register MenuBridgePlugin: {}", e);
     }
+    // The `.expect`s below are deliberate (the tray-icon#13 review's TI-2
+    // proposal to soften them into log+return was rejected): with no bridge
+    // session the process is in an init-order misuse state that has no sane
+    // recovery, and a loud abort is the honest failure mode. If they are
+    // ever softened anyway, the client construction MUST move above the
+    // `OHOS_APP.set` claim: a failure after the claim leaves the slot
+    // claimed without wiring, and a `OnceLock` claim cannot be rolled
+    // back — every later set_ohos_app would then take the "already set"
+    // early return with no client ever constructed.
     let statusbar_client = StatusBarClient::new(&app)
         .expect("Failed to create StatusBarClient");
     let menu_client = openharmony_ability_plugin_menu::MenuClient::new(&app)
         .expect("Failed to create MenuClient");
-    OHOS_APP.set(app).expect("OHOS_APP already set");
+    // Unreachable in practice — OHOS_APP was claimed at the top of this
+    // function, so any competing caller already returned there; kept
+    // defensive (same S42 hardening). Only this `.set()` path is
+    // panic-free: the two `.expect`s above still panic when no bridge
+    // session is active (uninitialized / misuse scenarios).
     if STATUSBAR_CLIENT.set(statusbar_client).is_err() {
-        panic!("STATUSBAR_CLIENT already set");
+        log::warn!("[TrayIcon] STATUSBAR_CLIENT already set — keeping the first client");
+        return;
     }
     // Inject muda's MenuClient (muda does not hold OpenHarmonyApp itself)
     muda::set_menu_client(menu_client);
@@ -165,6 +210,29 @@ impl TrayIcon {
             ));
         }
 
+        // Unsupported builder options fail loudly at build time (tray#13
+        // review follow-up F4): the attrs use Option semantics so an
+        // explicit `with_*` call is distinguishable from the default, and
+        // each explicit-but-unsupported option warns exactly once here —
+        // matching the per-call warnings of the runtime setters. tauri's
+        // config-driven path does not forward these on OHOS, so a warning
+        // here always means a direct builder call asked for them.
+        if attrs.temp_dir_path.is_some() {
+            log::warn!(
+                "[TrayIcon] with_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)"
+            );
+        }
+        if attrs.menu_on_left_click.is_some() {
+            log::warn!(
+                "[TrayIcon] with_menu_on_left_click has no effect on OpenHarmony; use set_quick_operation to configure the left-click popup"
+            );
+        }
+        if attrs.menu_on_right_click.is_some() {
+            log::warn!(
+                "[TrayIcon] with_menu_on_right_click has no effect on OpenHarmony (menu presentation for status bar icons is system-controlled)"
+            );
+        }
+
         // Make muda's CHECK_ITEMS the single check-state source for this menu:
         // status-bar check clicks flip the user's CheckMenuItem flags through
         // it (muda::toggle_check_item); no local mirror is kept.
@@ -227,7 +295,13 @@ impl TrayIcon {
             let status_bar_icon = icon::icon_to_status_bar_icon(&i.inner, is_template)?;
             openharmony_ability_plugin_statusbar::StatusBarUpdateIconRequest::from(status_bar_icon)
         } else {
-            // Clear icon by sending empty icon data
+            // Clear icon by sending empty icon data. OHOS semantics diverge from
+            // the upstream doc line ("it will remove the icon"): the statusbar
+            // entry itself is kept with cleared pixels. Note the side effect —
+            // attrs.icon becomes None, so any later remove+re-add style update
+            // (set_title/set_quick_operation/set_icon_as_template) can no longer
+            // rebuild the item; those skip with a warn instead of removing the
+            // entry (see set_title).
             let empty_icon = StatusBarIcon::default();
             openharmony_ability_plugin_statusbar::StatusBarUpdateIconRequest::from(empty_icon)
         };
@@ -315,8 +389,20 @@ impl TrayIcon {
         if *self.is_visible.borrow() {
             // Pre-compute the add request on the calling thread (borrows self.attrs),
             // then dispatch remove+add together in one closure so they stay ordered.
-            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
-            let add_request = item.as_ref().map(|i| StatusBarAddRequest::from(i));
+            // Build failure (typically: attrs has no icon after set_icon(None)) must
+            // NOT fall through to a remove without a re-add — that silently deletes
+            // the tray entry while is_visible/TRAY_VISIBLE still claim armed, and the
+            // single statusbar slot then rejects every later TrayIcon::new. Skip the
+            // dispatch instead and keep the current entry; the attrs update above
+            // survives, so the next successful rebuild (e.g. set_icon with an icon)
+            // picks it up.
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_title skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return;
+            };
+            let add_request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
                 with_statusbar_client("set_title", |client| {
                     if let Err(e) =
@@ -324,10 +410,8 @@ impl TrayIcon {
                     {
                         record_bridge_error("set_title remove", &e);
                     }
-                    if let Some(request) = add_request {
-                        if let Err(e) = futures_executor::block_on(client.add(request)) {
-                            record_bridge_error("set_title add", &e);
-                        }
+                    if let Err(e) = futures_executor::block_on(client.add(add_request)) {
+                        record_bridge_error("set_title add", &e);
                     }
                 });
             });
@@ -366,8 +450,15 @@ impl TrayIcon {
     pub fn set_quick_operation(&mut self, config: Option<crate::QuickOperationConfig>) {
         self.attrs.borrow_mut().quick_operation = config;
         if *self.is_visible.borrow() {
-            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
-            let add_request = item.as_ref().map(|i| StatusBarAddRequest::from(i));
+            // Same guard as set_title: a remove without a re-add would silently
+            // delete the tray entry (build fails when attrs has no icon).
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_quick_operation skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return;
+            };
+            let add_request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
                 with_statusbar_client("set_quick_operation", |client| {
                     if let Err(e) =
@@ -375,17 +466,19 @@ impl TrayIcon {
                     {
                         record_bridge_error("set_quick_operation remove", &e);
                     }
-                    if let Some(request) = add_request {
-                        if let Err(e) = futures_executor::block_on(client.add(request)) {
-                            record_bridge_error("set_quick_operation add", &e);
-                        }
+                    if let Err(e) = futures_executor::block_on(client.add(add_request)) {
+                        record_bridge_error("set_quick_operation add", &e);
                     }
                 });
             });
         }
     }
 
-    pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {}
+    pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {
+        // OHOS tray icons are transferred through the bridge (base64) rather
+        // than written to disk, so there is no temp dir to configure.
+        log::warn!("[TrayIcon] set_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)");
+    }
 
     pub fn set_icon_as_template(&mut self, is_template: bool) -> crate::Result<()> {
         // No-op if value unchanged — avoids unnecessary remove+re-add
@@ -394,7 +487,19 @@ impl TrayIcon {
         }
         self.attrs.borrow_mut().icon_is_template = is_template;
         if *self.is_visible.borrow() {
-            let item = build_item_from_attrs(&self.attrs.borrow())?;
+            // Same guard as set_title: a remove without a re-add would silently
+            // delete the tray entry (build fails when attrs has no icon). The
+            // public `TrayIcon::set_icon_as_template` returns (), so the old
+            // `?` form's error was swallowed by that caller without any log —
+            // warn here instead and keep the existing entry in place; the
+            // attrs update above survives, so the next successful rebuild
+            // (e.g. set_icon with an icon) picks it up.
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_icon_as_template skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return Ok(());
+            };
             let request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
                 with_statusbar_client("set_icon_as_template", |client| {

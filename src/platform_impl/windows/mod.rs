@@ -97,8 +97,8 @@ impl TrayIcon {
                 tooltip: attrs.tooltip.clone(),
                 entered: false,
                 last_position: None,
-                menu_on_left_click: attrs.menu_on_left_click,
-                menu_on_right_click: attrs.menu_on_right_click,
+                menu_on_left_click: attrs.menu_on_left_click.unwrap_or(true),
+                menu_on_right_click: attrs.menu_on_right_click.unwrap_or(true),
             };
 
             let hwnd = CreateWindowExW(
