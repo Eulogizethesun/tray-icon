@@ -88,6 +88,15 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     if let Err(e) = app.register_plugin(openharmony_ability_plugin_menu::MenuBridgePlugin) {
         log::error!("[TrayIcon] failed to register MenuBridgePlugin: {}", e);
     }
+    // The `.expect`s below are deliberate (the tray-icon#13 review's TI-2
+    // proposal to soften them into log+return was rejected): with no bridge
+    // session the process is in an init-order misuse state that has no sane
+    // recovery, and a loud abort is the honest failure mode. If they are
+    // ever softened anyway, the client construction MUST move above the
+    // `OHOS_APP.set` claim: a failure after the claim leaves the slot
+    // claimed without wiring, and a `OnceLock` claim cannot be rolled
+    // back — every later set_ohos_app would then take the "already set"
+    // early return with no client ever constructed.
     let statusbar_client = StatusBarClient::new(&app)
         .expect("Failed to create StatusBarClient");
     let menu_client = openharmony_ability_plugin_menu::MenuClient::new(&app)
@@ -478,7 +487,19 @@ impl TrayIcon {
         }
         self.attrs.borrow_mut().icon_is_template = is_template;
         if *self.is_visible.borrow() {
-            let item = build_item_from_attrs(&self.attrs.borrow())?;
+            // Same guard as set_title: a remove without a re-add would silently
+            // delete the tray entry (build fails when attrs has no icon). The
+            // public `TrayIcon::set_icon_as_template` returns (), so the old
+            // `?` form's error was swallowed by that caller without any log —
+            // warn here instead and keep the existing entry in place; the
+            // attrs update above survives, so the next successful rebuild
+            // (e.g. set_icon with an icon) picks it up.
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_icon_as_template skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return Ok(());
+            };
             let request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
                 with_statusbar_client("set_icon_as_template", |client| {

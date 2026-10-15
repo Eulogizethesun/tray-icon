@@ -1,5 +1,9 @@
 # Changelog
 
+## \[Unreleased]
+
+- **Breaking:** `TrayIconAttributes::menu_on_left_click` / `menu_on_right_click` changed from `bool` to `Option<bool>`, and now default to `None` ("not specified") instead of `true`. This lets the OpenHarmony backend distinguish an unset option from an explicit setting and warn at build time about unsupported combinations. Downstream code constructing `TrayIconAttributes` directly must wrap the value in `Some(..)`; builder users (`with_menu_on_left_click` / `with_menu_on_right_click`) and platform impls reading `unwrap_or(true)` semantics are unaffected. Ships with the next minor version.
+
 ## \[0.24.0]
 
 - [`19bcab3`](https://www.github.com/tauri-apps/tray-icon/commit/19bcab382753cbbb883b7d6ae96d07111fc73e67) ([#305](https://www.github.com/tauri-apps/tray-icon/pull/305) by [@expenses](https://www.github.com/tauri-apps/tray-icon/../../expenses)) Make gtk an optional feature (enabled by default)

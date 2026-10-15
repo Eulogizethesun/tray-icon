@@ -145,11 +145,12 @@ pub use self::tray_icon_id::TrayIconId;
 /// This must be called before creating any tray icons on OpenHarmony.
 /// Tauri calls this automatically during app initialization.
 ///
-/// First registration wins: the app slot is claimed once per process (an atomic
-/// check-and-claim ahead of plugin registration), and a later call with a
-/// different app is rejected with a warning — the first registration stays
-/// authoritative for the process lifetime. Passing the same shared
-/// `OpenHarmonyApp` again is the normal re-entry and is a harmless fast path.
+/// First registration wins: the app slot is claimed once per process (an
+/// atomic check-and-claim ahead of plugin registration), and any later call —
+/// whether it passes the same `OpenHarmonyApp` again or a different one — is
+/// ignored with a warning; the first registration stays authoritative for the
+/// process lifetime. The duplicate guard does not compare app identity, so a
+/// same-app re-entry warns the same way a different-app call does.
 #[cfg(target_env = "ohos")]
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     platform_impl::set_ohos_app(app);
@@ -395,9 +396,8 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **OHOS:** no-op — icons are transferred through the bridge, not
-    ///   written to disk. A warning is logged at build time when set
-    ///   (tray#13 review follow-up F4), unlike
-    ///   [`TrayIcon::set_temp_dir_path`] which warns per call.
+    ///   written to disk. A warning is logged at build time when set,
+    ///   unlike [`TrayIcon::set_temp_dir_path`] which warns per call.
     pub fn with_temp_dir_path<P: AsRef<Path>>(mut self, s: P) -> Self {
         self.attrs.temp_dir_path = Some(s.as_ref().to_path_buf());
         self
@@ -420,10 +420,10 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported — a warning is logged at build time
-    ///   (tray#13 review follow-up F4), matching
-    ///   [`TrayIcon::set_show_menu_on_left_click`]. Left-click behavior is
-    ///   configured per-icon via [`TrayIcon::set_quick_operation`] instead.
+    /// - **OHOS:** Unsupported — a warning is logged at build time,
+    ///   matching [`TrayIcon::set_show_menu_on_left_click`]. Left-click
+    ///   behavior is configured per-icon via [`TrayIcon::set_quick_operation`]
+    ///   instead.
     pub fn with_menu_on_left_click(mut self, enable: bool) -> Self {
         self.attrs.menu_on_left_click = Some(enable);
         self
@@ -434,10 +434,9 @@ impl TrayIconBuilder {
     /// ## Platform-specific:
     ///
     /// - **Linux:** Unsupported.
-    /// - **OHOS:** Unsupported — a warning is logged at build time
-    ///   (tray#13 review follow-up F4), matching
-    ///   [`TrayIcon::set_show_menu_on_right_click`]. Menu presentation for
-    ///   status bar icons is system-controlled.
+    /// - **OHOS:** Unsupported — a warning is logged at build time,
+    ///   matching [`TrayIcon::set_show_menu_on_right_click`]. Menu
+    ///   presentation for status bar icons is system-controlled.
     pub fn with_menu_on_right_click(mut self, enable: bool) -> Self {
         self.attrs.menu_on_right_click = Some(enable);
         self
