@@ -215,8 +215,10 @@ impl TrayIcon {
         // explicit `with_*` call is distinguishable from the default, and
         // each explicit-but-unsupported option warns exactly once here —
         // matching the per-call warnings of the runtime setters. tauri's
-        // config-driven path does not forward these on OHOS, so a warning
-        // here always means a direct builder call asked for them.
+        // config-driven path forwards only values that deviate from the
+        // serde default (its config bools cannot express "unset"), so a
+        // warning here means either a direct builder call or a non-default
+        // config value.
         if attrs.temp_dir_path.is_some() {
             log::warn!(
                 "[TrayIcon] with_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)"
@@ -660,6 +662,22 @@ fn warn_disabled_item_once() {
     }
 }
 
+// OHOS status-bar submenus are limited to one level: the SDK's
+// `StatusBarSubMenuItem` has no nested-submenu field
+// (@hms.pcService.statusBarManager.d.ts), so a submenu nested inside another
+// submenu degrades to a clickable leaf and its children are dropped. Warn
+// once per process so developers know the depth is not honored; the muda
+// menubar path (MenuBarComponent renders any depth) is unaffected.
+static WARNED_NESTED_SUBMENU: AtomicBool = AtomicBool::new(false);
+
+fn warn_nested_submenu_once() {
+    if !WARNED_NESTED_SUBMENU.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "[TrayIcon] menu contains nested submenus, but the OHOS status-bar API supports only one submenu level — deeper items are dropped and nested titles become clickable leaves (the menubar path is not affected)"
+        );
+    }
+}
+
 fn collect_metadata_from_items(
     items: &[MenuJsonItem],
     predefined_map: &mut HashMap<String, String>,
@@ -868,6 +886,13 @@ pub(crate) fn menu_json_item_to_status_bar_item(
             .into_iter()
             .filter(|child| !is_separator(child))
             .map(|child| {
+                // Nested submenu (depth >= 2): `StatusBarSubMenuItem` has no
+                // nested-submenu field, so this child degrades to a clickable
+                // leaf and its own submenu_items are dropped (see
+                // warn_nested_submenu_once).
+                if child.item_type == "submenu" {
+                    warn_nested_submenu_once();
+                }
                 let text = strip_mnemonics(&child.text.unwrap_or_default());
                 let options = build_item_options(&child.item_type, child.checked, child.icon.as_deref());
                 StatusBarSubMenuItem {

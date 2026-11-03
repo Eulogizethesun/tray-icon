@@ -11,6 +11,8 @@ tray-icon lets you create tray icons for desktop applications.
 
 - On Windows and Linux or FreeBSD, an event loop must be running on the thread, on Windows, a win32 event loop and on Linux or FreeBSD, a gtk event loop. It doesn't need to be the main thread but you have to create the tray icon on the same thread as the event loop.
 - On macOS, an event loop must be running on the main thread so you also need to create the tray icon on the main thread.
+- On OHOS (OpenHarmony), tray (status bar) menu items cannot be disabled: the system `StatusBarMenuItem` API has no `enabled` field, so the enabled flag is ignored on the status bar path and disabled items remain clickable and still fire their commands (a warning is logged once per process when the menu contains disabled items). The OHOS window menu bar and context-menu popups are not affected and honor the enabled flag.
+- On OHOS (OpenHarmony), tray (status bar) menus support only one level of submenus: the system `StatusBarSubMenuItem` API has no nested-submenu field, so items nested deeper than one submenu level are dropped and nested titles degrade to clickable leaves (a warning is logged once per process when the menu contains nested submenus). The OHOS window menu bar and context-menu popups are not affected and render any depth.
 
 ### Cargo Features
 

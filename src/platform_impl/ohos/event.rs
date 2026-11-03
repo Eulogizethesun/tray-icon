@@ -178,9 +178,17 @@ fn execute_predefined_action(
             });
         }
         // macOS-only semantics with no OHOS counterpart — muda can still emit
-        // these on cross-platform menus, so they are listed explicitly as
-        // no-ops instead of falling into the catch-all below.
-        "hideOthers" | "services" => {}
+        // these on cross-platform menus (upstream Windows also no-ops them in
+        // its predefined dispatch `_` arm), so they are listed explicitly
+        // instead of falling into the catch-all below. Warn so the dead click
+        // leaves a trace — the item is rendered and clickable, and a silent
+        // no-op is indistinguishable from a lost event.
+        "hideOthers" | "services" => {
+            log::warn!(
+                "[TrayIcon] predefined action '{}' is macOS-only with no OHOS counterpart; click ignored",
+                predefined_type
+            );
+        }
         _ => {
             log::debug!("[TrayIcon] unsupported predefined action: {}", predefined_type);
         }
