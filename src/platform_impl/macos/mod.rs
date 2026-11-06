@@ -85,8 +85,8 @@ impl TrayIcon {
                         .and_then(|menu| Retained::retain(menu.ns_menu().cast::<NSMenu>())),
                 ),
                 status_item: ns_status_item.retain(),
-                menu_on_left_click: Cell::new(attrs.menu_on_left_click),
-                menu_on_right_click: Cell::new(attrs.menu_on_right_click),
+                menu_on_left_click: Cell::new(attrs.menu_on_left_click.unwrap_or(true)),
+                menu_on_right_click: Cell::new(attrs.menu_on_right_click.unwrap_or(true)),
             });
             let tray_target: Retained<TrayTarget> = msg_send![super(target), initWithFrame: frame];
             tray_target.setWantsLayer(true);
@@ -241,14 +241,14 @@ impl TrayIcon {
         if let Some(tray_target) = &self.tray_target {
             tray_target.ivars().menu_on_left_click.set(enable);
         }
-        self.attrs.menu_on_left_click = enable;
+        self.attrs.menu_on_left_click = Some(enable);
     }
 
     pub fn set_show_menu_on_right_click(&mut self, enable: bool) {
         if let Some(tray_target) = &self.tray_target {
             tray_target.ivars().menu_on_right_click.set(enable);
         }
-        self.attrs.menu_on_right_click = enable;
+        self.attrs.menu_on_right_click = Some(enable);
     }
 
     pub fn show_menu(&self) {

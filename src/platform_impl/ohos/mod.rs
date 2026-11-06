@@ -9,6 +9,7 @@ use once_cell::sync::OnceCell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use openharmony_ability_plugin_statusbar::{
@@ -20,18 +21,61 @@ use openharmony_ability_plugin_statusbar::{
 static OHOS_APP: OnceCell<openharmony_ability::OpenHarmonyApp> = OnceCell::new();
 static STATUSBAR_CLIENT: OnceCell<StatusBarClient> = OnceCell::new();
 
+/// Process-level "a tray is currently registered with the status bar" mirror.
+/// OHOS allows only one status-bar tray per ability (a second addToStatusBar
+/// is rejected with 16000078 "Multi-instance is not supported"), and this
+/// backend keeps process-global state (MENU_METADATA, event::TRAY_ID) — a
+/// second visible tray would silently shadow the first. `TrayIcon::new`
+/// therefore refuses to create one instead.
+static TRAY_VISIBLE: AtomicBool = AtomicBool::new(false);
+
 pub(crate) static MENU_METADATA: once_cell::sync::Lazy<Mutex<MenuMetadata>> =
     once_cell::sync::Lazy::new(|| Mutex::new(MenuMetadata::default()));
 
 #[derive(Default)]
 pub(crate) struct MenuMetadata {
     pub predefined_map: HashMap<String, String>,
-    pub check_state: HashMap<String, bool>,
+    /// About metadata by item id — carried on the execute-predefined request
+    /// so the ArkTS About panel shows the muda `AboutMetadata`. No check-state
+    /// mirror is kept: muda's CHECK_ITEMS is the single check-state source
+    /// (see `muda::register_check_items` / `muda::toggle_check_item`).
+    pub about_metadata: HashMap<String, AboutMetadataJson>,
     pub menu_json: Option<String>,
     pub flat_ids: Vec<String>,
 }
 
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
+    // First registration stays authoritative (NG4 one-app-per-process,
+    // design D14 S42): a second call means someone re-ran tray init for
+    // another UIAbility instance — return early so the duplicate does not
+    // redo the wiring below (plugin registration, client construction, muda
+    // injection, event-channel registration). Note this does NOT save SCB
+    // clientProxyMap slots: nothing in the skipped path performs a bridge
+    // round trip (the client constructors are pure local handle-taking,
+    // `app.bridge()`), and the system-side clientProxyMap is populated per
+    // pid at ArkTS addToStatusBar — exhausted by zombie pids from killed
+    // processes, not by repeated Rust-side init.
+    if OHOS_APP.get().is_some() {
+        log::warn!(
+            "[TrayIcon] duplicate set_ohos_app ignored (first registration stays authoritative)"
+        );
+        return;
+    }
+    // Claim the app slot BEFORE any wiring: `OnceLock::set` is the atomic
+    // check-and-claim, so the loser of a concurrent first-call exits here —
+    // before plugin registration (whose "already registered" Err would log a
+    // misleading error for what is actually a benign duplicate) and before
+    // client construction. The `.get()` guard above stays as the fast path
+    // with the clearer message for the common sequential-duplicate case.
+    // A lost race is warn + early return (design D14 S42, openspec
+    // multi-uiability-windows) so a stray concurrent re-init cannot take
+    // down the whole process — the first registration stays authoritative,
+    // and the loser must not re-run the wiring below (plugin registration,
+    // client construction, muda injection, event-channel registration).
+    if OHOS_APP.set(app.clone()).is_err() {
+        log::warn!("[TrayIcon] OHOS_APP already set — ignoring duplicate set_ohos_app (first registration stays authoritative)");
+        return;
+    }
     // Register the Rust-side bridge plugins BEFORE creating the clients that
     // dispatch calls through them. `register_plugin` populates the native
     // module's bridge-plugin declarations, which the ArkTS BridgeHost matches
@@ -44,13 +88,27 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     if let Err(e) = app.register_plugin(openharmony_ability_plugin_menu::MenuBridgePlugin) {
         log::error!("[TrayIcon] failed to register MenuBridgePlugin: {}", e);
     }
+    // The `.expect`s below are deliberate (the tray-icon#13 review's TI-2
+    // proposal to soften them into log+return was rejected): with no bridge
+    // session the process is in an init-order misuse state that has no sane
+    // recovery, and a loud abort is the honest failure mode. If they are
+    // ever softened anyway, the client construction MUST move above the
+    // `OHOS_APP.set` claim: a failure after the claim leaves the slot
+    // claimed without wiring, and a `OnceLock` claim cannot be rolled
+    // back — every later set_ohos_app would then take the "already set"
+    // early return with no client ever constructed.
     let statusbar_client = StatusBarClient::new(&app)
         .expect("Failed to create StatusBarClient");
     let menu_client = openharmony_ability_plugin_menu::MenuClient::new(&app)
         .expect("Failed to create MenuClient");
-    OHOS_APP.set(app).expect("OHOS_APP already set");
+    // Unreachable in practice — OHOS_APP was claimed at the top of this
+    // function, so any competing caller already returned there; kept
+    // defensive (same S42 hardening). Only this `.set()` path is
+    // panic-free: the two `.expect`s above still panic when no bridge
+    // session is active (uninitialized / misuse scenarios).
     if STATUSBAR_CLIENT.set(statusbar_client).is_err() {
-        panic!("STATUSBAR_CLIENT already set");
+        log::warn!("[TrayIcon] STATUSBAR_CLIENT already set — keeping the first client");
+        return;
     }
     // Inject muda's MenuClient (muda does not hold OpenHarmonyApp itself)
     muda::set_menu_client(menu_client);
@@ -59,8 +117,38 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     event::register_statusbar_channels();
 }
 
-pub(crate) fn get_statusbar_client() -> &'static StatusBarClient {
-    STATUSBAR_CLIENT.get().expect("STATUSBAR_CLIENT not initialized")
+// ─── Last bridge error (diagnostics for fire-and-forget calls) ───────────────
+// Bridge calls are dispatched to the worker thread below; their results
+// cannot be returned without blocking the caller, so the worker caches the
+// last failure here and `tray_icon::last_bridge_error()` exposes it for
+// embedder (tauri) diagnostics.
+
+static LAST_BRIDGE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Returns the last status-bar bridge error (if any), without clearing it.
+pub fn last_bridge_error() -> Option<String> {
+    LAST_BRIDGE_ERROR.lock().unwrap().clone()
+}
+
+/// Records a bridge failure from the worker thread.
+fn record_bridge_error(op: &str, err: &impl std::fmt::Display) {
+    log::warn!("[TrayIcon] {} error: {}", op, err);
+    *LAST_BRIDGE_ERROR.lock().unwrap() = Some(format!("{}: {}", op, err));
+}
+
+/// Runs `f` with the StatusBarClient on the calling (worker) thread. A missing
+/// client is recorded as a bridge error instead of panicking: a panicking
+/// worker thread dies permanently and silently drops every subsequent tray
+/// bridge call.
+fn with_statusbar_client(op: &str, f: impl FnOnce(&StatusBarClient)) {
+    match STATUSBAR_CLIENT.get() {
+        Some(client) => f(client),
+        None => {
+            log::error!("[TrayIcon] {} skipped: STATUSBAR_CLIENT not initialized", op);
+            *LAST_BRIDGE_ERROR.lock().unwrap() =
+                Some(format!("{}: STATUSBAR_CLIENT not initialized", op));
+        }
+    }
 }
 
 // ─── Bridge worker thread ───────────────────────────────────────────────────
@@ -111,14 +199,56 @@ pub struct TrayIcon {
 
 impl TrayIcon {
     pub fn new(id: TrayIconId, attrs: TrayIconAttributes) -> crate::Result<Self> {
+        // OHOS allows a single status-bar tray per ability (a second
+        // addToStatusBar is rejected with 16000078 "Multi-instance is not
+        // supported"), and this backend keeps process-global state
+        // (MENU_METADATA, event::TRAY_ID) — a second visible tray would
+        // silently shadow the first. Fail loudly instead.
+        if TRAY_VISIBLE.load(Ordering::Acquire) {
+            return Err(crate::Error::Unsupported(
+                "only one statusbar tray per ability".to_string(),
+            ));
+        }
+
+        // Unsupported builder options fail loudly at build time (tray#13
+        // review follow-up F4): the attrs use Option semantics so an
+        // explicit `with_*` call is distinguishable from the default, and
+        // each explicit-but-unsupported option warns exactly once here —
+        // matching the per-call warnings of the runtime setters. tauri's
+        // config-driven path forwards only values that deviate from the
+        // serde default (its config bools cannot express "unset"), so a
+        // warning here means either a direct builder call or a non-default
+        // config value.
+        if attrs.temp_dir_path.is_some() {
+            log::warn!(
+                "[TrayIcon] with_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)"
+            );
+        }
+        if attrs.menu_on_left_click.is_some() {
+            log::warn!(
+                "[TrayIcon] with_menu_on_left_click has no effect on OpenHarmony; use set_quick_operation to configure the left-click popup"
+            );
+        }
+        if attrs.menu_on_right_click.is_some() {
+            log::warn!(
+                "[TrayIcon] with_menu_on_right_click has no effect on OpenHarmony (menu presentation for status bar icons is system-controlled)"
+            );
+        }
+
+        // Make muda's CHECK_ITEMS the single check-state source for this menu:
+        // status-bar check clicks flip the user's CheckMenuItem flags through
+        // it (muda::toggle_check_item); no local mirror is kept.
+        if let Some(menu) = attrs.menu.as_ref().and_then(|m| m.as_menu()) {
+            muda::register_check_items(menu);
+        }
+
         // Extract metadata before building the item (menus may be consumed)
-        let (predefined_map, check_state, menu_json) =
-            extract_menu_metadata(&attrs.menu);
+        let (predefined_map, about_metadata, menu_json) = extract_menu_metadata(&attrs.menu);
 
         {
             let mut metadata = MENU_METADATA.lock().unwrap();
             metadata.predefined_map = predefined_map;
-            metadata.check_state = check_state;
+            metadata.about_metadata = about_metadata;
             metadata.menu_json = menu_json;
         }
 
@@ -133,24 +263,27 @@ impl TrayIcon {
         // main thread is never blocked waiting on a TSFN response (would deadlock).
         let request = StatusBarAddRequest::from(&item);
         dispatch_bridge_call(move || {
-            let client = get_statusbar_client();
-            // Best-effort removal of any stale status-bar registration left by a
-            // prior/killed instance of this app. statusBarManager rejects a
-            // second addToStatusBar for the same ability with 16000078
-            // "Multi-instance is not supported" (surfaced to the caller as a
-            // generic 401 "check param error"). removeFromStatusBar is a no-op
-            // when nothing is registered, so this is safe on a fresh launch.
-            if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
-                log::warn!("[TrayIcon] pre-add remove (best-effort) error: {}", e);
-            }
-            match futures_executor::block_on(client.add(request)) {
-                Ok(_) => {}
-                Err(e) => log::warn!("[TrayIcon] add error in new: {}", e),
-            }
+            with_statusbar_client("add", |client| {
+                // Best-effort removal of any stale status-bar registration left by a
+                // prior/killed instance of this app. statusBarManager rejects a
+                // second addToStatusBar for the same ability with 16000078
+                // "Multi-instance is not supported" (surfaced to the caller as a
+                // generic 401 "check param error"). removeFromStatusBar is a no-op
+                // when nothing is registered, so this is safe on a fresh launch.
+                if let Err(e) =
+                    futures_executor::block_on(client.remove(StatusBarRemoveRequest {}))
+                {
+                    log::warn!("[TrayIcon] pre-add remove (best-effort) error: {}", e);
+                }
+                if let Err(e) = futures_executor::block_on(client.add(request)) {
+                    record_bridge_error("add", &e);
+                }
+            });
         });
 
         event::register_tray_id(id);
         event::start_event_forward_thread();
+        TRAY_VISIBLE.store(true, Ordering::Release);
 
         Ok(Self {
             attrs: RefCell::new(attrs),
@@ -164,28 +297,40 @@ impl TrayIcon {
             let status_bar_icon = icon::icon_to_status_bar_icon(&i.inner, is_template)?;
             openharmony_ability_plugin_statusbar::StatusBarUpdateIconRequest::from(status_bar_icon)
         } else {
-            // Clear icon by sending empty icon data
+            // Clear icon by sending empty icon data. OHOS semantics diverge from
+            // the upstream doc line ("it will remove the icon"): the statusbar
+            // entry itself is kept with cleared pixels. Note the side effect —
+            // attrs.icon becomes None, so any later remove+re-add style update
+            // (set_title/set_quick_operation/set_icon_as_template) can no longer
+            // rebuild the item; those skip with a warn instead of removing the
+            // entry (see set_title).
             let empty_icon = StatusBarIcon::default();
             openharmony_ability_plugin_statusbar::StatusBarUpdateIconRequest::from(empty_icon)
         };
         dispatch_bridge_call(move || {
-            let client = get_statusbar_client();
-            if let Err(e) = futures_executor::block_on(client.update_icon(request)) {
-                log::warn!("[TrayIcon] update_icon error in set_icon: {}", e);
-            }
+            with_statusbar_client("update_icon", |client| {
+                if let Err(e) = futures_executor::block_on(client.update_icon(request)) {
+                    record_bridge_error("update_icon", &e);
+                }
+            });
         });
         self.attrs.borrow_mut().icon = icon;
         Ok(())
     }
 
     pub fn set_menu(&mut self, menu: Option<Box<dyn crate::menu::ContextMenu>>) {
-        let (menus, predefined_map, check_state, menu_json) =
+        // See TrayIcon::new: muda owns the single check-state source.
+        if let Some(m) = menu.as_ref().and_then(|m| m.as_menu()) {
+            muda::register_check_items(m);
+        }
+
+        let (menus, predefined_map, about_metadata, menu_json) =
             menu_to_status_bar_items_with_metadata(&menu);
 
         {
             let mut metadata = MENU_METADATA.lock().unwrap();
             metadata.predefined_map = predefined_map;
-            metadata.check_state = check_state;
+            metadata.about_metadata = about_metadata;
             metadata.menu_json = menu_json;
         }
 
@@ -201,10 +346,11 @@ impl TrayIcon {
         };
         if let Some(request) = request {
             dispatch_bridge_call(move || {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.update_menu(request)) {
-                    log::warn!("[TrayIcon] update_menu error in set_menu: {}", e);
-                }
+                with_statusbar_client("update_menu", |client| {
+                    if let Err(e) = futures_executor::block_on(client.update_menu(request)) {
+                        record_bridge_error("update_menu", &e);
+                    }
+                });
             });
         }
         self.attrs.borrow_mut().menu = menu;
@@ -216,17 +362,21 @@ impl TrayIcon {
             if s.is_empty() { None } else { Some(s) }
         });
         if let Some(ref t) = tips {
-            if t.len() <= 128 {
-                let request = openharmony_ability_plugin_statusbar::StatusBarUpdateTipsRequest {
-                    tips: t.clone(),
-                };
-                dispatch_bridge_call(move || {
-                    let client = get_statusbar_client();
+            if t.len() > 128 {
+                return Err(crate::Error::OhosError(
+                    "tooltip exceeds 128 chars".to_string(),
+                ));
+            }
+            let request = openharmony_ability_plugin_statusbar::StatusBarUpdateTipsRequest {
+                tips: t.clone(),
+            };
+            dispatch_bridge_call(move || {
+                with_statusbar_client("update_tips", |client| {
                     if let Err(e) = futures_executor::block_on(client.update_tips(request)) {
-                        log::warn!("[TrayIcon] update_tips error in set_tooltip: {}", e);
+                        record_bridge_error("update_tips", &e);
                     }
                 });
-            }
+            });
         }
         self.attrs.borrow_mut().tooltip = tips;
         Ok(())
@@ -241,18 +391,31 @@ impl TrayIcon {
         if *self.is_visible.borrow() {
             // Pre-compute the add request on the calling thread (borrows self.attrs),
             // then dispatch remove+add together in one closure so they stay ordered.
-            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
-            let add_request = item.as_ref().map(|i| StatusBarAddRequest::from(i));
+            // Build failure (typically: attrs has no icon after set_icon(None)) must
+            // NOT fall through to a remove without a re-add — that silently deletes
+            // the tray entry while is_visible/TRAY_VISIBLE still claim armed, and the
+            // single statusbar slot then rejects every later TrayIcon::new. Skip the
+            // dispatch instead and keep the current entry; the attrs update above
+            // survives, so the next successful rebuild (e.g. set_icon with an icon)
+            // picks it up.
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_title skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return;
+            };
+            let add_request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
-                    log::warn!("[TrayIcon] remove error in set_title: {}", e);
-                }
-                if let Some(request) = add_request {
-                    if let Err(e) = futures_executor::block_on(client.add(request)) {
-                        log::warn!("[TrayIcon] add error in set_title: {}", e);
+                with_statusbar_client("set_title", |client| {
+                    if let Err(e) =
+                        futures_executor::block_on(client.remove(StatusBarRemoveRequest {}))
+                    {
+                        record_bridge_error("set_title remove", &e);
                     }
-                }
+                    if let Err(e) = futures_executor::block_on(client.add(add_request)) {
+                        record_bridge_error("set_title add", &e);
+                    }
+                });
             });
         }
     }
@@ -262,20 +425,26 @@ impl TrayIcon {
             let item = build_item_from_attrs(&self.attrs.borrow())?;
             let request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.add(request)) {
-                    log::warn!("[TrayIcon] add error in set_visible: {}", e);
-                }
+                with_statusbar_client("set_visible", |client| {
+                    if let Err(e) = futures_executor::block_on(client.add(request)) {
+                        record_bridge_error("set_visible add", &e);
+                    }
+                });
             });
             *self.is_visible.borrow_mut() = true;
+            TRAY_VISIBLE.store(true, Ordering::Release);
         } else if !visible && *self.is_visible.borrow() {
             dispatch_bridge_call(|| {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
-                    log::warn!("[TrayIcon] remove error in set_visible: {}", e);
-                }
+                with_statusbar_client("set_visible", |client| {
+                    if let Err(e) =
+                        futures_executor::block_on(client.remove(StatusBarRemoveRequest {}))
+                    {
+                        record_bridge_error("set_visible remove", &e);
+                    }
+                });
             });
             *self.is_visible.borrow_mut() = false;
+            TRAY_VISIBLE.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -283,23 +452,35 @@ impl TrayIcon {
     pub fn set_quick_operation(&mut self, config: Option<crate::QuickOperationConfig>) {
         self.attrs.borrow_mut().quick_operation = config;
         if *self.is_visible.borrow() {
-            let item = build_item_from_attrs(&self.attrs.borrow()).ok();
-            let add_request = item.as_ref().map(|i| StatusBarAddRequest::from(i));
+            // Same guard as set_title: a remove without a re-add would silently
+            // delete the tray entry (build fails when attrs has no icon).
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_quick_operation skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return;
+            };
+            let add_request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
-                    log::warn!("[TrayIcon] remove error in set_quick_operation: {}", e);
-                }
-                if let Some(request) = add_request {
-                    if let Err(e) = futures_executor::block_on(client.add(request)) {
-                        log::warn!("[TrayIcon] add error in set_quick_operation: {}", e);
+                with_statusbar_client("set_quick_operation", |client| {
+                    if let Err(e) =
+                        futures_executor::block_on(client.remove(StatusBarRemoveRequest {}))
+                    {
+                        record_bridge_error("set_quick_operation remove", &e);
                     }
-                }
+                    if let Err(e) = futures_executor::block_on(client.add(add_request)) {
+                        record_bridge_error("set_quick_operation add", &e);
+                    }
+                });
             });
         }
     }
 
-    pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {}
+    pub fn set_temp_dir_path<P: AsRef<std::path::Path>>(&mut self, _path: Option<P>) {
+        // OHOS tray icons are transferred through the bridge (base64) rather
+        // than written to disk, so there is no temp dir to configure.
+        log::warn!("[TrayIcon] set_temp_dir_path has no effect on OpenHarmony (icons are not written to disk)");
+    }
 
     pub fn set_icon_as_template(&mut self, is_template: bool) -> crate::Result<()> {
         // No-op if value unchanged — avoids unnecessary remove+re-add
@@ -308,16 +489,31 @@ impl TrayIcon {
         }
         self.attrs.borrow_mut().icon_is_template = is_template;
         if *self.is_visible.borrow() {
-            let item = build_item_from_attrs(&self.attrs.borrow())?;
+            // Same guard as set_title: a remove without a re-add would silently
+            // delete the tray entry (build fails when attrs has no icon). The
+            // public `TrayIcon::set_icon_as_template` returns (), so the old
+            // `?` form's error was swallowed by that caller without any log —
+            // warn here instead and keep the existing entry in place; the
+            // attrs update above survives, so the next successful rebuild
+            // (e.g. set_icon with an icon) picks it up.
+            let Some(item) = build_item_from_attrs(&self.attrs.borrow()).ok() else {
+                log::warn!(
+                    "[TrayIcon] set_icon_as_template skipped: tray item cannot be rebuilt from current attrs (no icon?); leaving the existing entry in place"
+                );
+                return Ok(());
+            };
             let request = StatusBarAddRequest::from(&item);
             dispatch_bridge_call(move || {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
-                    log::warn!("[TrayIcon] remove error in set_icon_as_template: {}", e);
-                }
-                if let Err(e) = futures_executor::block_on(client.add(request)) {
-                    log::warn!("[TrayIcon] add error in set_icon_as_template: {}", e);
-                }
+                with_statusbar_client("set_icon_as_template", |client| {
+                    if let Err(e) =
+                        futures_executor::block_on(client.remove(StatusBarRemoveRequest {}))
+                    {
+                        record_bridge_error("set_icon_as_template remove", &e);
+                    }
+                    if let Err(e) = futures_executor::block_on(client.add(request)) {
+                        record_bridge_error("set_icon_as_template add", &e);
+                    }
+                });
             });
         }
         Ok(())
@@ -348,12 +544,16 @@ impl Drop for TrayIcon {
         if *self.is_visible.borrow() {
             // Closure captures no `self` — only re-fetches the 'static client on the worker.
             dispatch_bridge_call(|| {
-                let client = get_statusbar_client();
-                if let Err(e) = futures_executor::block_on(client.remove(StatusBarRemoveRequest {})) {
-                    log::warn!("[TrayIcon] remove error on drop: {}", e);
-                }
-                // No unregister_*_handler calls — plugin lifecycle manages event registration.
+                with_statusbar_client("remove", |client| {
+                    if let Err(e) =
+                        futures_executor::block_on(client.remove(StatusBarRemoveRequest {}))
+                    {
+                        record_bridge_error("remove on drop", &e);
+                    }
+                    // No unregister_*_handler calls — plugin lifecycle manages event registration.
+                });
             });
+            TRAY_VISIBLE.store(false, Ordering::Release);
         }
     }
 }
@@ -383,14 +583,14 @@ fn menu_to_status_bar_items(
     })
 }
 
-/// Extract menu metadata (predefined_map, check_state, menu_json) without
+/// Extract menu metadata (predefined_map, about_metadata, menu_json) without
 /// converting to StatusBarMenuItem. Used by `new()` which delegates the
 /// conversion to `build_item_from_attrs()`.
 fn extract_menu_metadata(
     menu: &Option<Box<dyn crate::menu::ContextMenu>>,
 ) -> (
     HashMap<String, String>,
-    HashMap<String, bool>,
+    HashMap<String, AboutMetadataJson>,
     Option<String>,
 ) {
     let Some(m) = menu.as_ref() else {
@@ -409,10 +609,10 @@ fn extract_menu_metadata(
     }
 
     let mut predefined_map = HashMap::new();
-    let mut check_state = HashMap::new();
-    collect_metadata_from_items(&items, &mut predefined_map, &mut check_state);
+    let mut about_metadata = HashMap::new();
+    collect_metadata_from_items(&items, &mut predefined_map, &mut about_metadata);
 
-    (predefined_map, check_state, Some(json))
+    (predefined_map, about_metadata, Some(json))
 }
 
 fn menu_to_status_bar_items_with_metadata(
@@ -420,7 +620,7 @@ fn menu_to_status_bar_items_with_metadata(
 ) -> (
     Option<Vec<Vec<StatusBarMenuItem>>>,
     HashMap<String, String>,
-    HashMap<String, bool>,
+    HashMap<String, AboutMetadataJson>,
     Option<String>,
 ) {
     let empty = (None, HashMap::new(), HashMap::new(), None);
@@ -434,9 +634,9 @@ fn menu_to_status_bar_items_with_metadata(
     }
 
     let mut predefined_map = HashMap::new();
-    let mut check_state = HashMap::new();
+    let mut about_metadata = HashMap::new();
 
-    collect_metadata_from_items(&items, &mut predefined_map, &mut check_state);
+    collect_metadata_from_items(&items, &mut predefined_map, &mut about_metadata);
 
     let groups = split_items_into_groups(items);
 
@@ -446,13 +646,42 @@ fn menu_to_status_bar_items_with_metadata(
         Some(groups)
     };
 
-    (result, predefined_map, check_state, Some(json))
+    (result, predefined_map, about_metadata, Some(json))
+}
+
+// OHOS status-bar menu items cannot be disabled (StatusBarMenuItem has no
+// enabled flag), so muda's disabled items stay clickable. Warn once per
+// process so developers know that state is not honored.
+static WARNED_DISABLED_ITEMS: AtomicBool = AtomicBool::new(false);
+
+fn warn_disabled_item_once() {
+    if !WARNED_DISABLED_ITEMS.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "[TrayIcon] menu contains disabled items, but OHOS status-bar items cannot be disabled — they will remain clickable"
+        );
+    }
+}
+
+// OHOS status-bar submenus are limited to one level: the SDK's
+// `StatusBarSubMenuItem` has no nested-submenu field
+// (@hms.pcService.statusBarManager.d.ts), so a submenu nested inside another
+// submenu degrades to a clickable leaf and its children are dropped. Warn
+// once per process so developers know the depth is not honored; the muda
+// menubar path (MenuBarComponent renders any depth) is unaffected.
+static WARNED_NESTED_SUBMENU: AtomicBool = AtomicBool::new(false);
+
+fn warn_nested_submenu_once() {
+    if !WARNED_NESTED_SUBMENU.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "[TrayIcon] menu contains nested submenus, but the OHOS status-bar API supports only one submenu level — deeper items are dropped and nested titles become clickable leaves (the menubar path is not affected)"
+        );
+    }
 }
 
 fn collect_metadata_from_items(
     items: &[MenuJsonItem],
     predefined_map: &mut HashMap<String, String>,
-    check_state: &mut HashMap<String, bool>,
+    about_metadata: &mut HashMap<String, AboutMetadataJson>,
 ) {
     for item in items {
         if item.item_type == "predefined" {
@@ -460,12 +689,18 @@ fn collect_metadata_from_items(
                 if pt != "separator" {
                     predefined_map.insert(item.id.clone(), pt.clone());
                 }
+                if pt == "about" {
+                    if let Some(ref meta) = item.about_metadata {
+                        about_metadata.insert(item.id.clone(), meta.clone());
+                    }
+                }
             }
-        } else if item.item_type == "check" {
-            check_state.insert(item.id.clone(), item.checked.unwrap_or(false));
+        }
+        if item.enabled == Some(false) && !is_separator(item) {
+            warn_disabled_item_once();
         }
         if let Some(ref children) = item.submenu_items {
-            collect_metadata_from_items(children, predefined_map, check_state);
+            collect_metadata_from_items(children, predefined_map, about_metadata);
         }
     }
 }
@@ -527,8 +762,25 @@ pub(crate) fn remap_menu_codes_to_indices(
     flat_ids
 }
 
+/// Strips Windows-style mnemonics: a single `&` marks the next character as
+/// the mnemonic (dropped), while `&&` is an escaped literal `&` (kept, single).
+/// This is the single stripping point for status-bar menu titles — muda's
+/// serializer keeps the raw text.
 fn strip_mnemonics(text: &str) -> String {
-    text.replace('&', "")
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            if chars.peek() == Some(&'&') {
+                chars.next();
+                out.push('&');
+            }
+            // Single `&` marks a mnemonic — drop it.
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
@@ -557,7 +809,7 @@ fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((rgba, width, height))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 #[allow(dead_code)]
 pub(crate) struct MenuJsonItem {
     id: String,
@@ -578,28 +830,44 @@ pub(crate) struct MenuJsonItem {
     #[serde(default)]
     icon: Option<String>,
     #[serde(rename = "aboutMetadata", default)]
-    about_metadata: Option<AboutMetadataJson>,
+    pub(crate) about_metadata: Option<AboutMetadataJson>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone, Default)]
 #[allow(dead_code)]
 pub(crate) struct AboutMetadataJson {
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    version: Option<String>,
+    pub(crate) version: Option<String>,
     #[serde(rename = "shortVersion", default)]
-    short_version: Option<String>,
+    pub(crate) short_version: Option<String>,
     #[serde(default)]
-    authors: Option<Vec<String>>,
+    pub(crate) authors: Option<Vec<String>>,
     #[serde(default)]
-    comments: Option<String>,
+    pub(crate) comments: Option<String>,
     #[serde(default)]
-    copyright: Option<String>,
+    pub(crate) copyright: Option<String>,
     #[serde(default)]
-    license: Option<String>,
+    pub(crate) license: Option<String>,
     #[serde(default)]
-    website: Option<String>,
+    pub(crate) website: Option<String>,
+}
+
+impl From<AboutMetadataJson> for openharmony_ability_plugin_statusbar::StatusBarAboutMetadata {
+    fn from(meta: AboutMetadataJson) -> Self {
+        use openharmony_ability_plugin_statusbar::StatusBarAboutMetadata;
+        StatusBarAboutMetadata {
+            name: meta.name,
+            version: meta.version,
+            short_version: meta.short_version,
+            authors: meta.authors,
+            comments: meta.comments,
+            copyright: meta.copyright,
+            license: meta.license,
+            website: meta.website,
+        }
+    }
 }
 
 pub(crate) fn is_separator(item: &MenuJsonItem) -> bool {
@@ -618,6 +886,13 @@ pub(crate) fn menu_json_item_to_status_bar_item(
             .into_iter()
             .filter(|child| !is_separator(child))
             .map(|child| {
+                // Nested submenu (depth >= 2): `StatusBarSubMenuItem` has no
+                // nested-submenu field, so this child degrades to a clickable
+                // leaf and its own submenu_items are dropped (see
+                // warn_nested_submenu_once).
+                if child.item_type == "submenu" {
+                    warn_nested_submenu_once();
+                }
                 let text = strip_mnemonics(&child.text.unwrap_or_default());
                 let options = build_item_options(&child.item_type, child.checked, child.icon.as_deref());
                 StatusBarSubMenuItem {
@@ -719,8 +994,9 @@ fn build_item_from_attrs(
     let quick_operation = if let Some(ref config) = attrs.quick_operation {
         QuickOperation {
             ability_name: config.ability_name.clone(),
+            // Empty title → the ArkTS side falls back to the app name.
             title: if config.title.is_empty() {
-                attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+                attrs.title.clone().unwrap_or_default()
             } else {
                 config.title.clone()
             },
@@ -729,14 +1005,15 @@ fn build_item_from_attrs(
             loading_status: config.loading_status,
         }
     } else {
+        // No embedder configuration: stay neutral — an empty title falls back
+        // to the app name on the ArkTS side and `None` uses the system-default
+        // module. Tauri-app defaults (product name / "entry" module) belong to
+        // the tauri crate's tray builder, not this platform-agnostic library.
         QuickOperation {
             ability_name: String::new(),
-            title: attrs
-                .title
-                .clone()
-                .unwrap_or_else(|| "Tauri App".to_string()),
+            title: attrs.title.clone().unwrap_or_default(),
             height: 200,
-            module_name: Some("entry".to_string()),
+            module_name: None,
             loading_status: None,
         }
     };
@@ -917,7 +1194,7 @@ mod tests {
         let qo = QuickOperation {
             ability_name: config.ability_name.clone(),
             title: if config.title.is_empty() {
-                attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+                attrs.title.clone().unwrap_or_default()
             } else {
                 config.title.clone()
             },
@@ -939,22 +1216,22 @@ mod tests {
         attrs.title = Some("My App".into());
         // quick_operation is None by default
 
-        // Verify the default QuickOperation struct that build_item_from_attrs would create
+        // Verify the neutral default QuickOperation struct that
+        // build_item_from_attrs would create: the title falls back to attrs and
+        // the module uses the system default — Tauri-app defaults (product
+        // name / "entry") live in the tauri crate's tray builder, not here.
         let qo = QuickOperation {
             ability_name: String::new(),
-            title: attrs
-                .title
-                .clone()
-                .unwrap_or_else(|| "Tauri App".to_string()),
+            title: attrs.title.clone().unwrap_or_default(),
             height: 200,
-            module_name: Some("entry".to_string()),
+            module_name: None,
             loading_status: None,
         };
 
         assert!(qo.ability_name.is_empty());
         assert_eq!(qo.title, "My App");
         assert_eq!(qo.height, 200);
-        assert_eq!(qo.module_name, Some("entry".to_string()));
+        assert_eq!(qo.module_name, None);
         assert!(qo.loading_status.is_none());
     }
 
@@ -973,7 +1250,7 @@ mod tests {
 
         let config = attrs.quick_operation.as_ref().unwrap();
         let title = if config.title.is_empty() {
-            attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+            attrs.title.clone().unwrap_or_default()
         } else {
             config.title.clone()
         };
@@ -982,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_operation_no_attrs_title_falls_back_to_default() {
+    fn quick_operation_no_titles_is_empty_for_arkts_fallback() {
         use crate::QuickOperationConfig;
         let mut attrs = TrayIconAttributes::default();
         // attrs.title is None
@@ -996,12 +1273,13 @@ mod tests {
 
         let config = attrs.quick_operation.as_ref().unwrap();
         let title = if config.title.is_empty() {
-            attrs.title.clone().unwrap_or_else(|| "Tauri App".to_string())
+            attrs.title.clone().unwrap_or_default()
         } else {
             config.title.clone()
         };
 
-        assert_eq!(title, "Tauri App");
+        // Neutral default: the ArkTS side falls back to the app name
+        assert_eq!(title, "");
     }
 
     #[test]
@@ -1140,9 +1418,9 @@ mod tests {
 
     #[test]
     fn test_strip_mnemonics_double_ampersand() {
-        // Double ampersand is an escaped literal & — but strip_mnemonics removes ALL &
-        assert_eq!(strip_mnemonics("A&&B"), "AB");
-        assert_eq!(strip_mnemonics("&&&&"), "");
+        // Double ampersand is an escaped literal & — strips to a single &
+        assert_eq!(strip_mnemonics("A&&B"), "A&B");
+        assert_eq!(strip_mnemonics("&&&&"), "&&");
     }
 
     #[test]
@@ -1287,50 +1565,40 @@ mod tests {
             },
         ];
         let mut predefined_map = HashMap::new();
-        let mut check_state = HashMap::new();
-        collect_metadata_from_items(&items, &mut predefined_map, &mut check_state);
+        let mut about_metadata = HashMap::new();
+        collect_metadata_from_items(&items, &mut predefined_map, &mut about_metadata);
         // "copy" should be in the map, "separator" should be excluded
         assert_eq!(predefined_map.len(), 1);
         assert_eq!(predefined_map.get("p1"), Some(&"copy".to_string()));
         assert!(!predefined_map.contains_key("sep1"));
-        assert!(check_state.is_empty());
+        assert!(about_metadata.is_empty());
     }
 
     #[test]
-    fn test_collect_metadata_check_items() {
-        let items = vec![
-            MenuJsonItem {
-                id: "c1".to_string(),
-                text: Some("Toggle".to_string()),
-                item_type: "check".to_string(),
-                enabled: Some(true),
-                accelerator: None,
-                predefined_type: None,
-                submenu_items: None,
-                checked: Some(true),
-                icon: None,
-                about_metadata: None,
-            },
-            MenuJsonItem {
-                id: "c2".to_string(),
-                text: Some("Off".to_string()),
-                item_type: "check".to_string(),
-                enabled: Some(true),
-                accelerator: None,
-                predefined_type: None,
-                submenu_items: None,
-                checked: None, // defaults to false
-                icon: None,
-                about_metadata: None,
-            },
-        ];
+    fn test_collect_metadata_about_metadata() {
+        let items = vec![MenuJsonItem {
+            id: "about1".to_string(),
+            text: Some("About".to_string()),
+            item_type: "predefined".to_string(),
+            enabled: Some(true),
+            accelerator: None,
+            predefined_type: Some("about".to_string()),
+            submenu_items: None,
+            checked: None,
+            icon: None,
+            about_metadata: Some(AboutMetadataJson {
+                name: Some("TestApp".to_string()),
+                version: Some("1.0.0".to_string()),
+                ..Default::default()
+            }),
+        }];
         let mut predefined_map = HashMap::new();
-        let mut check_state = HashMap::new();
-        collect_metadata_from_items(&items, &mut predefined_map, &mut check_state);
-        assert!(predefined_map.is_empty());
-        assert_eq!(check_state.len(), 2);
-        assert_eq!(check_state.get("c1"), Some(&true));
-        assert_eq!(check_state.get("c2"), Some(&false));
+        let mut about_metadata = HashMap::new();
+        collect_metadata_from_items(&items, &mut predefined_map, &mut about_metadata);
+        assert_eq!(predefined_map.get("about1"), Some(&"about".to_string()));
+        let meta = about_metadata.get("about1").unwrap();
+        assert_eq!(meta.name.as_deref(), Some("TestApp"));
+        assert_eq!(meta.version.as_deref(), Some("1.0.0"));
     }
 
     #[test]
@@ -1363,9 +1631,9 @@ mod tests {
             },
         ];
         let mut predefined_map = HashMap::new();
-        let mut check_state = HashMap::new();
-        collect_metadata_from_items(&items, &mut predefined_map, &mut check_state);
-        assert!(check_state.contains_key("nested_check"));
+        let mut about_metadata = HashMap::new();
+        collect_metadata_from_items(&items, &mut predefined_map, &mut about_metadata);
+        assert!(!predefined_map.contains_key("nested_check"));
     }
 
     // ─── split_items_into_groups edge cases ──────────────────────────────
@@ -1491,18 +1759,18 @@ mod tests {
             Some(Box::new(MockContextMenu {
                 json: "not json at all".to_string(),
             }));
-        let (predefined, check_state, menu_json) = extract_menu_metadata(&menu);
+        let (predefined, about_metadata, menu_json) = extract_menu_metadata(&menu);
         assert!(predefined.is_empty());
-        assert!(check_state.is_empty());
+        assert!(about_metadata.is_empty());
         assert!(menu_json.is_none());
     }
 
     #[test]
     fn extract_menu_metadata_none_menu_returns_empty() {
         let menu: Option<Box<dyn crate::menu::ContextMenu>> = None;
-        let (predefined, check_state, menu_json) = extract_menu_metadata(&menu);
+        let (predefined, about_metadata, menu_json) = extract_menu_metadata(&menu);
         assert!(predefined.is_empty());
-        assert!(check_state.is_empty());
+        assert!(about_metadata.is_empty());
         assert!(menu_json.is_none());
     }
 }
